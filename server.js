@@ -16,7 +16,7 @@ app.use(express.json());
 
 // ── DB connection (Neon) ─────────────────────────────────
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL2,
   ssl: { rejectUnauthorized: false }
 });
 
