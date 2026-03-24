@@ -1,0 +1,17 @@
+{
+  "name": "nestle-dms-backend",
+  "version": "3.0.0",
+  "description": "Nestlé DMS Backend — Render + Neon PostgreSQL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.3",
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
