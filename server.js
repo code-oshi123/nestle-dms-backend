@@ -1,5 +1,7 @@
 const express = require('express');
 const cors    = require('cors');
+const bcrypt  = require('bcrypt');
+const jwt     = require('jsonwebtoken');
 const { Pool } = require('pg');
 
 const app = express();
@@ -11,7 +13,22 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ── health check ──────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET || 'nestle-dms-secret-change-in-prod';
+
+// ── Middleware: verify JWT token ──────────────
+function auth(req, res, next) {
+  const header = req.headers['authorization'];
+  const token  = header && header.split(' ')[1]; // "Bearer <token>"
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// ── health check / keep-alive ─────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Nestlé DMS API' }));
 
 // ══════════════════════════════════════════════
@@ -19,20 +36,33 @@ app.get('/', (req, res) => res.json({ status: 'ok', service: 'Nestlé DMS API' }
 // ══════════════════════════════════════════════
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
     const r = await pool.query(
-      'SELECT * FROM "Users" WHERE email=$1 AND password=$2', [email, password]
+      'SELECT * FROM "Users" WHERE "Email"=$1', [email]
     );
     if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const u = r.rows[0];
-    res.json({ id: u.id, name: u.name, email: u.email, role: u.role, avatar: u.avatar });
+
+    // ── FIX 1: Compare password with bcrypt hash ──
+    const match = await bcrypt.compare(password, u.PasswordHash);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // ── FIX 2: Issue JWT token ──
+    const token = jwt.sign(
+      { id: u.id, email: u.email, role: u.role },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    res.json({ id: u.id, name: u.name, email: u.email, role: u.role, avatar: u.avatar, token });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════════
-// NOTIFICATIONS
+// NOTIFICATIONS  (protected)
 // ══════════════════════════════════════════════
-app.get('/api/notifications', async (req, res) => {
+app.get('/api/notifications', auth, async (req, res) => {
   const { userId } = req.query;
   try {
     const r = await pool.query(
@@ -46,7 +76,7 @@ app.get('/api/notifications', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/notifications/unread', async (req, res) => {
+app.get('/api/notifications/unread', auth, async (req, res) => {
   const { userId } = req.query;
   try {
     const r = await pool.query(
@@ -57,14 +87,14 @@ app.get('/api/notifications/unread', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/notifications/:id/read', async (req, res) => {
+app.put('/api/notifications/:id/read', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Notifications" SET "isRead"=true WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/notifications/read-all', async (req, res) => {
+app.put('/api/notifications/read-all', auth, async (req, res) => {
   const { userId } = req.body;
   try {
     await pool.query('UPDATE "Notifications" SET "isRead"=true WHERE "userId"=$1', [userId]);
@@ -80,16 +110,16 @@ async function notify(userId, title, message, type='info', refId=null) {
 }
 
 // ══════════════════════════════════════════════
-// REFERENCE DATA
+// REFERENCE DATA  (protected)
 // ══════════════════════════════════════════════
-app.get('/api/drivers', async (req, res) => {
+app.get('/api/drivers', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM "Drivers" ORDER BY name');
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/vehicles', async (req, res) => {
+app.get('/api/vehicles', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM "Vehicles" ORDER BY id');
     res.json(r.rows);
@@ -97,9 +127,9 @@ app.get('/api/vehicles', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// ORDERS
+// ORDERS  (protected)
 // ══════════════════════════════════════════════
-app.get('/api/orders', async (req, res) => {
+app.get('/api/orders', auth, async (req, res) => {
   const { role, userId } = req.query;
   try {
     let r;
@@ -122,7 +152,7 @@ app.get('/api/orders', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', auth, async (req, res) => {
   const { retailerId, retailerName, city, items, kg, priority, notes } = req.body;
   try {
     const r = await pool.query(
@@ -131,7 +161,6 @@ app.post('/api/orders', async (req, res) => {
       [retailerId, retailerName, city, items, kg, priority, notes||'']
     );
     const orderId = r.rows[0].id;
-    // notify all order_team users
     const staff = await pool.query('SELECT id FROM "Users" WHERE role=\'order_team\'');
     for (const s of staff.rows) {
       await notify(s.id, 'New Order Request', `${retailerName} requested ${items} items to ${city}`, 'info', orderId);
@@ -140,7 +169,7 @@ app.post('/api/orders', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/orders/:id/confirm', async (req, res) => {
+app.put('/api/orders/:id/confirm', auth, async (req, res) => {
   const { action, confirmedBy, rejectReason } = req.body;
   const status = action === 'confirm' ? 'confirmed' : 'rejected';
   try {
@@ -161,9 +190,9 @@ app.put('/api/orders/:id/confirm', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// DELIVERIES
+// DELIVERIES  (protected)
 // ══════════════════════════════════════════════
-app.get('/api/deliveries', async (req, res) => {
+app.get('/api/deliveries', auth, async (req, res) => {
   const { role, userId } = req.query;
   try {
     let r;
@@ -185,13 +214,12 @@ app.get('/api/deliveries', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/deliveries/consolidate', async (req, res) => {
+app.post('/api/deliveries/consolidate', auth, async (req, res) => {
   try {
     const orders = await pool.query('SELECT * FROM "Orders" WHERE status=\'confirmed\'');
     const confirmed = orders.rows;
     if (!confirmed.length) return res.json({ created: 0, held: 0 });
 
-    // single low-priority hold rule
     if (confirmed.length === 1 && !['urgent','high'].includes(confirmed[0].priority)) {
       return res.json({ created: 0, held: 1, reason: 'single_low_priority', orderId: confirmed[0].id });
     }
@@ -206,7 +234,6 @@ app.post('/api/deliveries/consolidate', async (req, res) => {
       created++;
     }
 
-    // notify route planners and warehouse
     const rp = await pool.query('SELECT id FROM "Users" WHERE role IN (\'route_planner\',\'warehouse\')');
     for (const u of rp.rows) {
       await notify(u.id, 'New Deliveries Ready', `${created} delivery record(s) created. Please assign drivers.`, 'info');
@@ -215,7 +242,7 @@ app.post('/api/deliveries/consolidate', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/deliveries/:id/assign', async (req, res) => {
+app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
   const { driverId, driverName, vehicleId } = req.body;
   const eta = new Date(Date.now() + 2*60*60*1000).toLocaleTimeString('en-LK', { hour:'2-digit', minute:'2-digit' });
   try {
@@ -223,7 +250,6 @@ app.put('/api/deliveries/:id/assign', async (req, res) => {
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
-    // notify driver and warehouse
     await notify(driverId, 'New Delivery Assigned 🚚', `You have been assigned delivery ${req.params.id}. ETA: ${eta}`, 'info', req.params.id);
     const wh = await pool.query('SELECT id FROM "Users" WHERE role=\'warehouse\'');
     for (const u of wh.rows) {
@@ -233,7 +259,7 @@ app.put('/api/deliveries/:id/assign', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/deliveries/:id/warehouse-ready', async (req, res) => {
+app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
@@ -245,7 +271,7 @@ app.put('/api/deliveries/:id/warehouse-ready', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/deliveries/:id/loaded', async (req, res) => {
+app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
@@ -257,11 +283,11 @@ app.put('/api/deliveries/:id/loaded', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/deliveries/:id/status', async (req, res) => {
+app.put('/api/deliveries/:id/status', auth, async (req, res) => {
   const { newStatus, note, updatedBy } = req.body;
   try {
     await pool.query('UPDATE "Deliveries" SET status=$1 WHERE id=$2', [newStatus, req.params.id]);
-    const del  = await pool.query(
+    const del = await pool.query(
       `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city
        FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
       [req.params.id]
@@ -289,16 +315,16 @@ app.put('/api/deliveries/:id/status', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// ROUTES
+// ROUTES  (protected)
 // ══════════════════════════════════════════════
-app.get('/api/routes', async (req, res) => {
+app.get('/api/routes', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM "Routes" ORDER BY "createdAt" DESC');
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/routes', async (req, res) => {
+app.post('/api/routes', auth, async (req, res) => {
   const { driverId, driverName, vehicleId, stops, distKm, durMins, cities } = req.body;
   try {
     const r = await pool.query(
