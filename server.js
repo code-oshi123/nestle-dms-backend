@@ -122,13 +122,26 @@ app.get('/api/vehicles', auth, async (req, res) => {
 // Returns available products (backed by the "Stock" table).
 app.get('/api/products', auth, async (req, res) => {
   try {
-    const r = await pool.query(
-      'SELECT id, "productName" FROM "Stock" ORDER BY "productName"'
-    );
-    res.json(r.rows);
-  } catch {
+    // Be tolerant to different casing/naming for product-name column.
+    // (Some setups create columns with camelCase inside quotes; others may store them lowercase.)
+    const queries = [
+      'SELECT id, "productName"  AS "productName" FROM "Stock" ORDER BY "productName"',
+      'SELECT id, "productname" AS "productName" FROM "Stock" ORDER BY "productname"',
+      'SELECT id, productName     AS "productName" FROM "Stock" ORDER BY productName',
+      'SELECT id, productname    AS "productName" FROM "Stock" ORDER BY productname',
+    ];
+
+    for (const q of queries) {
+      try {
+        const r = await pool.query(q);
+        if (Array.isArray(r.rows)) return res.json(r.rows);
+      } catch {}
+    }
+
+    return res.json([]);
+  } catch (e) {
     // Stock table might not exist yet; keep frontend usable.
-    res.json([]);
+    return res.json([]);
   }
 });
 
