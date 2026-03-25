@@ -250,7 +250,7 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
-    await notify(driverId, 'New Delivery Assigned 🚚', `You have been assigned delivery ${req.params.id}. ETA: ${eta}`, 'info', req.params.id);
+    await notify(parseInt(driverId), 'New Delivery Assigned 🚚', `You have been assigned delivery ${req.params.id}. ETA: ${eta}`, 'info', req.params.id);
     const wh = await pool.query('SELECT id FROM "Users" WHERE role=\'warehouse\'');
     for (const u of wh.rows) {
       await notify(u.id, 'Delivery Assigned', `Delivery ${req.params.id} assigned to ${driverName}. Prepare cargo.`, 'info', req.params.id);
@@ -265,7 +265,7 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
     if (d?.driverId) {
-      await notify(d.driverId, 'Cargo Ready for Pickup 📦', `Cargo for delivery ${req.params.id} is ready at the warehouse.`, 'success', req.params.id);
+      await notify(parseInt(d.driverId), 'Cargo Ready for Pickup 📦', `Cargo for delivery ${req.params.id} is ready at the warehouse.`, 'success', req.params.id);
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -277,7 +277,7 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
     if (d?.driverId) {
-      await notify(d.driverId, 'Vehicle Loaded ✅', `Your vehicle for delivery ${req.params.id} has been loaded. Please confirm pickup.`, 'success', req.params.id);
+      await notify(parseInt(d.driverId), 'Vehicle Loaded ✅', `Your vehicle for delivery ${req.params.id} has been loaded. Please confirm pickup.`, 'success', req.params.id);
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
