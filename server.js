@@ -119,15 +119,29 @@ app.get('/api/vehicles', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Returns available products (backed by the "Stock" table).
+app.get('/api/products', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT id, "productName" FROM "Stock" ORDER BY "productName"'
+    );
+    res.json(r.rows);
+  } catch {
+    // Stock table might not exist yet; keep frontend usable.
+    res.json([]);
+  }
+});
+
 // ── Stock check helper ────────────────────────
 // Checks against a "Stock" table (id, productName, availableUnits, availableKg)
 // Falls back gracefully if table doesn't exist yet.
-async function checkStock(items, kg) {
+async function checkStock(productId, items, kg) {
   try {
     const r = await pool.query(
-      'SELECT "availableUnits", "availableKg" FROM "Stock" WHERE id=1'
+      'SELECT "productName", "availableUnits", "availableKg" FROM "Stock" WHERE id=$1',
+      [productId]
     );
-    if (!r.rows.length) return { ok: true }; // no stock table yet — allow
+    if (!r.rows.length) return { ok: true, productName: null }; // stock table exists, but no row — allow
     const s = r.rows[0];
     if (items > s.availableUnits) {
       return { ok: false, reason: `Requested ${items} units but only ${s.availableUnits} in stock` };
@@ -135,9 +149,9 @@ async function checkStock(items, kg) {
     if (kg > s.availableKg) {
       return { ok: false, reason: `Requested ${kg}kg but only ${s.availableKg}kg available` };
     }
-    return { ok: true };
+    return { ok: true, productName: s.productName || null };
   } catch {
-    return { ok: true }; // table might not exist — allow
+    return { ok: true, productName: null }; // table might not exist — allow
   }
 }
 
@@ -168,11 +182,23 @@ app.get('/api/orders', auth, async (req, res) => {
 });
 
 app.post('/api/orders', auth, async (req, res) => {
-  const { retailerId, retailerName, city, items, kg, priority, notes } = req.body;
+  const {
+    retailerId,
+    retailerName,
+    city,
+    items,
+    kg,
+    priority,
+    notes,
+    productId,
+    productName,
+    specifics
+  } = req.body;
 
   // ── FIX: Validate inputs strictly ──
   const itemsNum = Number(items);
   const kgNum    = Number(kg);
+  const productIdNum = productId ? Number(productId) : 1;
 
   if (!city || city.trim() === '') {
     return res.status(400).json({ error: 'City is required' });
@@ -183,19 +209,27 @@ app.post('/api/orders', auth, async (req, res) => {
   if (typeof kgNum !== 'number' || isNaN(kgNum) || kgNum <= 0) {
     return res.status(400).json({ error: 'Weight must be a positive number' });
   }
+  if (!Number.isInteger(productIdNum) || productIdNum <= 0) {
+    return res.status(400).json({ error: 'Product must be selected' });
+  }
   if (!['normal','high','urgent'].includes(priority)) {
     return res.status(400).json({ error: 'Invalid priority value' });
   }
 
   // ── FIX: Stock availability check ──
-  const stock = await checkStock(itemsNum, kgNum);
+  const stock = await checkStock(productIdNum, itemsNum, kgNum);
+  const productLabel =
+    (typeof productName === 'string' && productName.trim()) ? productName.trim() :
+    (typeof specifics === 'string' && specifics.trim()) ? specifics.trim() :
+    (stock && typeof stock.productName === 'string' && stock.productName.trim()) ? stock.productName.trim() :
+    `Product ${productIdNum}`;
   if (!stock.ok) {
     // Notify the retailer immediately about stock unavailability
     try {
       await notify(
         retailerId,
         'Order Rejected — Stock Unavailable ❌',
-        `Your order request was rejected automatically: ${stock.reason}. Please revise and resubmit.`,
+        `Your order request for ${productLabel} was rejected automatically: ${stock.reason}. Please revise and resubmit.`,
         'alert'
       );
     } catch {}
@@ -216,7 +250,7 @@ app.post('/api/orders', auth, async (req, res) => {
       await notify(
         s.id,
         'New Order Request 📋',
-        `${retailerName} requested ${itemsNum} items (${kgNum}kg) to ${city} — Priority: ${priority}`,
+        `${retailerName} requested ${itemsNum} items (${kgNum}kg) of ${productLabel} to ${city} — Priority: ${priority}`,
         'info',
         orderId
       );
