@@ -353,12 +353,33 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
   const eta = etaDate.toLocaleTimeString('en-LK', { hour:'2-digit', minute:'2-digit' });
 
   try {
+    // ── FIX: Block reassignment if route is already active (in-transit or completed) ──
+    const check = await pool.query('SELECT status, "driverId" AS "oldDriverId" FROM "Deliveries" WHERE id=$1', [req.params.id]);
+    if (!check.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    const current = check.rows[0];
+    const lockedStatuses = ['in-transit', 'delivered', 'failed'];
+    if (lockedStatuses.includes(current.status)) {
+      return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
+    }
+
+    // If previously assigned to a different driver, notify old driver of de-assignment
+    const oldDriverId = parseInt(current.oldDriverId);
+    if (oldDriverId && oldDriverId !== parseInt(driverId)) {
+      await notify(
+        oldDriverId,
+        'Delivery Reassigned ↩️',
+        `Delivery ${req.params.id} has been reassigned to another driver. It has been removed from your route.`,
+        'warning',
+        req.params.id
+      );
+    }
+
     await pool.query(
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
 
-    // ── FIX: Auto-save route data to Routes table on assign ──
+    // ── Auto-save/update route data to Routes table on assign ──
     const del = await pool.query(
       `SELECT d.*, o.city, o."retailerName" AS retailer, o.items, o.kg
        FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
@@ -366,20 +387,30 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
     );
     const d = del.rows[0];
     if (d) {
-      const distKm  = Math.round(42 + Math.random() * 30); // estimated per stop
+      const distKm  = Math.round(42 + Math.random() * 30);
       const durMins = Math.round(distKm * 2.8);
+      // Remove any old route for this delivery, then insert fresh
+      await pool.query('DELETE FROM "Routes" WHERE "deliveryId"=$1', [req.params.id]).catch(()=>{});
       await pool.query(
-        `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
-         VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
-        [driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city])]
-      );
+        `INSERT INTO "Routes"("deliveryId","driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         ON CONFLICT DO NOTHING`,
+        [req.params.id, driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city])]
+      ).catch(async () => {
+        // Fallback if deliveryId column doesn't exist yet — just insert without it
+        await pool.query(
+          `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
+           VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
+          [driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city])]
+        );
+      });
     }
 
-    // Notify driver
+    // ── FIX: Notify driver (driverId must be int) ──
     await notify(
       parseInt(driverId),
       'New Delivery Assigned 🚚',
-      `You have been assigned delivery ${req.params.id} to ${d?.city||''}. ETA: ${eta}`,
+      `You have been assigned delivery ${req.params.id} to ${d?.city||''}. Vehicle: ${vehicleId}. ETA: ${eta}. Check "My Routes" for full details.`,
       'info',
       req.params.id
     );
@@ -396,7 +427,7 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       );
     }
 
-    res.json({ eta });
+    res.json({ eta, driverName, vehicleId });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -485,8 +516,51 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
 // ROUTES
 // ══════════════════════════════════════════════
 app.get('/api/routes', auth, async (req, res) => {
+  const { driverId } = req.query;
   try {
-    const r = await pool.query('SELECT * FROM "Routes" ORDER BY "createdAt" DESC');
+    let r;
+    if (driverId) {
+      // ── FIX: Driver fetches their own routes with delivery details ──
+      r = await pool.query(
+        `SELECT rt.*, d.status AS deliveryStatus, d.eta,
+                o."retailerName" AS retailer, o.city AS orderCity, o.items, o.kg
+         FROM "Routes" rt
+         LEFT JOIN "Deliveries" d ON d."driverId"=rt."driverId" AND d.status NOT IN ('delivered','failed')
+         LEFT JOIN "Orders" o ON d."orderId"=o.id
+         WHERE rt."driverId"=$1
+         ORDER BY rt."createdAt" DESC`,
+        [driverId]
+      );
+    } else {
+      r = await pool.query(
+        `SELECT rt.*, d.status AS deliveryStatus, d.id AS deliveryId, d.eta
+         FROM "Routes" rt
+         LEFT JOIN "Deliveries" d ON d."driverId"=rt."driverId" AND d.status NOT IN ('delivered','failed')
+         ORDER BY rt."createdAt" DESC`
+      );
+    }
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FIX: Dedicated driver route endpoint — clean and simple ──
+app.get('/api/routes/my', auth, async (req, res) => {
+  const { driverId } = req.query;
+  if (!driverId) return res.status(400).json({ error: 'driverId required' });
+  try {
+    // Get today's active deliveries for this driver with route info
+    const r = await pool.query(
+      `SELECT d.id, d.status, d.eta, d."driverName", d."vehicleId",
+              o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio,
+              rt.id AS routeId, rt."distKm", rt."durMins", rt.cities, rt.stops
+       FROM "Deliveries" d
+       JOIN "Orders" o ON d."orderId"=o.id
+       LEFT JOIN "Routes" rt ON rt."driverId"=d."driverId"
+         AND rt.cities::text LIKE '%' || o.city || '%'
+       WHERE d."driverId"=$1
+       ORDER BY d."createdAt" DESC`,
+      [driverId]
+    );
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -500,7 +574,9 @@ app.post('/api/routes', auth, async (req, res) => {
       [driverId, driverName, vehicleId, stops, distKm, durMins, JSON.stringify(cities)]
     );
     res.json({ id: r.rows[0].id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ══════════════════════════════════════════════
