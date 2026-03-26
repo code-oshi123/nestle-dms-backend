@@ -528,8 +528,7 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    // FIX: coerce driverId safely — DB may return it as string or integer
-    const driverIdWR = d && d.driverId ? parseInt(d.driverId) : null;
+    const driverIdWR = d && d.driverId ? Number(d.driverId) : null;
     if (driverIdWR) {
       await notify(
         driverIdWR,
@@ -550,8 +549,7 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    // FIX: coerce driverId safely — DB may return it as string or integer
-    const driverIdL = d && d.driverId ? parseInt(d.driverId) : null;
+    const driverIdL = d && d.driverId ? Number(d.driverId) : null;
     if (driverIdL) {
       await notify(
         driverIdL,
@@ -573,12 +571,10 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
   if (!validStatuses.includes(newStatus)) {
     return res.status(400).json({ error: 'Invalid status value' });
   }
-  // Require a note/reason when marking as failed
   if (newStatus === 'failed' && (!note || note.trim() === '')) {
     return res.status(400).json({ error: 'A reason is required when marking a delivery as failed' });
   }
   try {
-    // Prevent going backwards: delivered/failed are terminal
     const cur = await pool.query('SELECT status FROM "Deliveries" WHERE id=$1', [req.params.id]);
     if (!cur.rows.length) return res.status(404).json({ error: 'Delivery not found' });
     const currentStatus = cur.rows[0].status;
@@ -618,7 +614,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
         req.params.id
       );
 
-      // 2. Notify Order Team, Warehouse, and Route Planner
+      // 2. Notify Order Team, Warehouse, Route Planner
       const staff = await pool.query(
         `SELECT id, role FROM "Users" WHERE role IN ('order_team', 'warehouse', 'route_planner')`
       );
@@ -636,8 +632,9 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
           req.params.id
         );
       }
-      // 3. Notify the distributor (driver) — they need to know their own delivery status was recorded
-      const driverId = d.driverId;
+
+      // 3. Notify the distributor (driver) — FIXED: Number() cast
+      const driverId = d.driverId ? Number(d.driverId) : null;
       if (driverId) {
         const driverMsg = newStatus === 'delivered'
           ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) confirmed as delivered ✅. Check your route for remaining stops.`
@@ -645,7 +642,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
           ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) recorded as failed ❌.${noteStr} Contact your planner for next steps.`
           : `Delivery ${req.params.id} to ${d.city} (${d.retailer}) marked in-transit 🚛.${noteStr}`;
         await notify(
-          parseInt(driverId),
+          driverId,
           `Your Delivery: ${statusLabel[newStatus] || newStatus}`,
           driverMsg,
           msgType[newStatus] || 'info',
