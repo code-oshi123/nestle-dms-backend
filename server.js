@@ -95,6 +95,17 @@ app.get('/api/notifications/unread', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// FIX Bug 1: read-all MUST be before /:id/read — otherwise Express matches
+// 'read-all' as the :id param and this route is never reached.
+app.put('/api/notifications/read-all', auth, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  try {
+    await pool.query('UPDATE "Notifications" SET "isRead"=true WHERE "userId"=$1', [userId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.put('/api/notifications/:id/read', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Notifications" SET "isRead"=true WHERE id=$1', [req.params.id]);
@@ -102,19 +113,16 @@ app.put('/api/notifications/:id/read', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/notifications/read-all', auth, async (req, res) => {
-  const { userId } = req.body;
-  try {
-    await pool.query('UPDATE "Notifications" SET "isRead"=true WHERE "userId"=$1', [userId]);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
+// FIX Bug 2: wrapped in try/catch so a DB error here never crashes the calling endpoint
 async function notify(userId, title, message, type='info', refId=null) {
-  await pool.query(
-    'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
-    [userId, title, message, type, refId]
-  );
+  try {
+    await pool.query(
+      'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
+      [userId, title, message, type, refId]
+    );
+  } catch (e) {
+    console.error('[notify] Failed for user ' + userId + ':', e.message);
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -520,14 +528,18 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    if (d?.driverId) {
+    // FIX: coerce driverId safely — DB may return it as string or integer
+    const driverIdWR = d && d.driverId ? parseInt(d.driverId) : null;
+    if (driverIdWR) {
       await notify(
-        parseInt(d.driverId),
+        driverIdWR,
         'Cargo Ready for Pickup 📦',
-        `Cargo for delivery ${req.params.id} is ready at the warehouse. Please proceed to collect.`,
+        `Your cargo for delivery ${req.params.id} is packed and ready at the warehouse. Please proceed to collect your vehicle.`,
         'success',
         req.params.id
       );
+    } else {
+      console.warn('[warehouse-ready] No driverId on delivery ' + req.params.id + ' — distributor not notified');
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -538,14 +550,18 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    if (d?.driverId) {
+    // FIX: coerce driverId safely — DB may return it as string or integer
+    const driverIdL = d && d.driverId ? parseInt(d.driverId) : null;
+    if (driverIdL) {
       await notify(
-        parseInt(d.driverId),
-        'Vehicle Loaded ✅',
-        `Your vehicle for delivery ${req.params.id} has been loaded and is ready. You may depart.`,
+        driverIdL,
+        'Vehicle Loaded ✅ — Ready to Depart',
+        `Your vehicle for delivery ${req.params.id} has been fully loaded. You are cleared to depart. Check "My Routes" for your stop sequence.`,
         'success',
         req.params.id
       );
+    } else {
+      console.warn('[loaded] No driverId on delivery ' + req.params.id + ' — distributor not notified');
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -620,8 +636,24 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
           req.params.id
         );
       }
+      // 3. Notify the distributor (driver) — they need to know their own delivery status was recorded
+      const driverId = d.driverId;
+      if (driverId) {
+        const driverMsg = newStatus === 'delivered'
+          ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) confirmed as delivered ✅. Check your route for remaining stops.`
+          : newStatus === 'failed'
+          ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) recorded as failed ❌.${noteStr} Contact your planner for next steps.`
+          : `Delivery ${req.params.id} to ${d.city} (${d.retailer}) marked in-transit 🚛.${noteStr}`;
+        await notify(
+          parseInt(driverId),
+          `Your Delivery: ${statusLabel[newStatus] || newStatus}`,
+          driverMsg,
+          msgType[newStatus] || 'info',
+          req.params.id
+        );
+      }
     }
-    res.json({ ok: true, newStatus, notified: ['retailer', 'order_team', 'warehouse', 'route_planner'] });
+    res.json({ ok: true, newStatus, notified: ['retailer', 'order_team', 'warehouse', 'route_planner', 'distributor'] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
