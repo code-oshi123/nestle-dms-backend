@@ -115,7 +115,6 @@ app.put('/api/notifications/:id/read', auth, async (req, res) => {
 
 // FIX Bug 2: wrapped in try/catch so a DB error here never crashes the calling endpoint
 async function notify(userId, title, message, type='info', refId=null) {
-  console.log('[notify] userId=' + userId + ' title=' + title);
   if (!userId || isNaN(Number(userId))) {
     console.error('[notify] SKIPPED - invalid userId:', userId);
     return;
@@ -125,9 +124,26 @@ async function notify(userId, title, message, type='info', refId=null) {
       'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
       [userId, title, message, type, refId]
     );
-    console.log('[notify] OK for userId=' + userId);
   } catch (e) {
     console.error('[notify] FAILED for userId=' + userId + ':', e.message);
+  }
+}
+
+// Resolves a Drivers.id to the matching Users.id (joins on name).
+// All notify() calls for drivers MUST use this so the right user gets the notification.
+async function driverUserId(driversId) {
+  if (!driversId) return null;
+  try {
+    const r = await pool.query(
+      `SELECT u.id FROM "Drivers" d
+       JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
+       WHERE d.id = $1`,
+      [driversId]
+    );
+    return r.rows[0]?.id || null;
+  } catch (e) {
+    console.error('[driverUserId] lookup failed:', e.message);
+    return null;
   }
 }
 
@@ -136,8 +152,6 @@ async function notify(userId, title, message, type='info', refId=null) {
 // ══════════════════════════════════════════════
 app.get('/api/drivers', auth, async (req, res) => {
   try {
-    // Join on name to get Users.id (the correct userId for notifications).
-    // Drivers table has no email or userId column, name is the only shared key.
     const r = await pool.query(`
       SELECT d.id, d.name, d.phone, u.id AS "userId"
       FROM "Drivers" d
@@ -511,8 +525,9 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
 
       // Rich driver notification with full briefing
       const notesLine = deliveryNotes ? `\nNotes: ${deliveryNotes}` : '';
+      const assignDriverUid = await driverUserId(parseInt(driverId));
       await notify(
-        parseInt(driverId),
+        assignDriverUid,
         '🚚 Delivery Assigned — Route Briefing',
         `You have been assigned delivery ${req.params.id}.\n\nStop 1: ${d.city} — ${d.retailer} (${d.items} items)\nVehicle: ${vehicleId}\nETA: ${eta}\nDistance: ~${distKm} km${notesLine}\n\nCheck "My Route Briefing" for full details.`,
         'info',
@@ -541,7 +556,7 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdWR = d && d.driverId ? Number(d.driverId) : null;
+    const driverIdWR = d && d.driverId ? await driverUserId(Number(d.driverId)) : null;
     if (driverIdWR) {
       await notify(
         driverIdWR,
@@ -562,7 +577,7 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdL = d && d.driverId ? Number(d.driverId) : null;
+    const driverIdL = d && d.driverId ? await driverUserId(Number(d.driverId)) : null;
     if (driverIdL) {
       await notify(
         driverIdL,
@@ -646,8 +661,8 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
         );
       }
 
-      // 3. Notify the distributor (driver) — FIXED: Number() cast
-      const driverId = d.driverId ? Number(d.driverId) : null;
+      // 3. Notify the distributor (driver)
+      const driverId = d.driverId ? await driverUserId(Number(d.driverId)) : null;
       if (driverId) {
         const driverMsg = newStatus === 'delivered'
           ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) confirmed as delivered ✅. Check your route for remaining stops.`
@@ -716,8 +731,9 @@ app.post('/api/routes/publish', auth, async (req, res) => {
 
         // Notify old driver if reassigned
         const oldDriverId = parseInt(cur.old);
-        if (oldDriverId && oldDriverId !== parseInt(driverId)) {
-          await notify(oldDriverId,
+        const oldDriverUid = oldDriverId ? await driverUserId(oldDriverId) : null;
+        if (oldDriverUid && oldDriverId !== parseInt(driverId)) {
+          await notify(oldDriverUid,
             'Delivery Reassigned ↩️',
             `Delivery ${s.deliveryId} has been moved to a new route. It is no longer on your schedule.`,
             'warning', s.deliveryId
@@ -742,8 +758,9 @@ app.post('/api/routes/publish', auth, async (req, res) => {
     const dateLine    = routeDate ? `Date: ${routeDate}` : '';
     const departLine  = depart    ? `Depot departure: ${depart}` : '';
 
+    const publishDriverUid = await driverUserId(parseInt(driverId));
     await notify(
-      parseInt(driverId),
+      publishDriverUid,
       `🗺️ Route Plan Published — ${stops.length} Stops`,
       `Your route has been planned and published.\n\n${dateLine}${dateLine&&departLine?'\n':''}${departLine}\nVehicle: ${vehicleId}\n${summaryLine}\n\nStop Sequence:\n${stopLines}${routeNotes ? '\n\nRoute Notes: ' + routeNotes : ''}\n\nCheck "My Route Briefing" for the full plan.`,
       'info',
