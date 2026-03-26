@@ -115,13 +115,19 @@ app.put('/api/notifications/:id/read', auth, async (req, res) => {
 
 // FIX Bug 2: wrapped in try/catch so a DB error here never crashes the calling endpoint
 async function notify(userId, title, message, type='info', refId=null) {
+  console.log('[notify] userId=' + userId + ' title=' + title);
+  if (!userId || isNaN(Number(userId))) {
+    console.error('[notify] SKIPPED - invalid userId:', userId);
+    return;
+  }
   try {
     await pool.query(
       'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
       [userId, title, message, type, refId]
     );
+    console.log('[notify] OK for userId=' + userId);
   } catch (e) {
-    console.error('[notify] Failed for user ' + userId + ':', e.message);
+    console.error('[notify] FAILED for userId=' + userId + ':', e.message);
   }
 }
 
@@ -130,12 +136,24 @@ async function notify(userId, title, message, type='info', refId=null) {
 // ══════════════════════════════════════════════
 app.get('/api/drivers', auth, async (req, res) => {
   try {
-    const r = await pool.query(`
-      SELECT d.*, u.id AS "userId"
-      FROM "Drivers" d
-      LEFT JOIN "Users" u ON u."Email" = d.email AND u.role = 'distributor'
-      ORDER BY d.name
-    `);
+    let r;
+    try {
+      // Try joining on email first
+      r = await pool.query(`
+        SELECT d.*, u.id AS "userId"
+        FROM "Drivers" d
+        LEFT JOIN "Users" u ON lower(u."Email") = lower(d.email) AND u.role = 'distributor'
+        ORDER BY d.name
+      `);
+    } catch {
+      // No email column in Drivers -- join on name
+      r = await pool.query(`
+        SELECT d.*, u.id AS "userId"
+        FROM "Drivers" d
+        LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
+        ORDER BY d.name
+      `);
+    }
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
