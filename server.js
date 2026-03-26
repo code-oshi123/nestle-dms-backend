@@ -716,38 +716,140 @@ app.get('/api/routes', auth, async (req, res) => {
   try {
     let r;
     if (driverId) {
-      r = await pool.query(
-        `SELECT rt.*, d.status AS deliveryStatus, d.eta,
-                o."retailerName" AS retailer, o.city AS orderCity, o.items, o.kg
-         FROM "Routes" rt
-         LEFT JOIN "Deliveries" d ON d."driverId"=rt."driverId" AND d.status NOT IN ('delivered','failed')
-         LEFT JOIN "Orders" o ON d."orderId"=o.id
-         WHERE rt."driverId"=$1
-         ORDER BY rt."createdAt" DESC`,
-        [driverId]
-      );
+      // Driver-scoped: used by planner's "Saved Routes" filtered by driver
+      try {
+        r = await pool.query(
+          `SELECT rt.id, rt."driverId", rt."driverName", rt."vehicleId", rt.stops, rt."distKm", rt."durMins",
+                  rt.cities, rt."stops_data", rt."routeDate", rt.depart, rt."routeNotes", rt."createdAt",
+                  d.status AS "deliveryStatus", d.id AS "deliveryId", d.eta
+           FROM "Routes" rt
+           LEFT JOIN "Deliveries" d ON d.id = (
+             SELECT id FROM "Deliveries" WHERE "driverId"=rt."driverId" ORDER BY "createdAt" DESC LIMIT 1
+           )
+           WHERE rt."driverId"=$1
+           ORDER BY rt."createdAt" DESC`,
+          [driverId]
+        );
+      } catch {
+        r = await pool.query(
+          `SELECT rt.id, rt."driverId", rt."driverName", rt."vehicleId", rt.stops,
+                  rt."distKm", rt."durMins", rt.cities, rt."createdAt",
+                  d.status AS "deliveryStatus", d.id AS "deliveryId", d.eta
+           FROM "Routes" rt
+           LEFT JOIN "Deliveries" d ON d."driverId"=rt."driverId"
+           WHERE rt."driverId"=$1
+           ORDER BY rt."createdAt" DESC`,
+          [driverId]
+        );
+      }
     } else {
-      r = await pool.query(
-        `SELECT rt.*, d.status AS deliveryStatus, d.id AS deliveryId, d.eta
-         FROM "Routes" rt
-         LEFT JOIN "Deliveries" d ON d."driverId"=rt."driverId" AND d.status NOT IN ('delivered','failed')
-         ORDER BY rt."createdAt" DESC`
-      );
+      // All routes — try with new columns, fall back to base
+      try {
+        r = await pool.query(
+          `SELECT rt.id, rt."driverId", rt."driverName", rt."vehicleId", rt.stops, rt."distKm", rt."durMins",
+                  rt.cities, rt."stops_data", rt."routeDate", rt.depart, rt."routeNotes", rt."createdAt",
+                  d.status AS "deliveryStatus", d.id AS "deliveryId", d.eta
+           FROM "Routes" rt
+           LEFT JOIN "Deliveries" d ON d.id = (
+             SELECT id FROM "Deliveries" WHERE "driverId"=rt."driverId" ORDER BY "createdAt" DESC LIMIT 1
+           )
+           ORDER BY rt."createdAt" DESC`
+        );
+      } catch {
+        r = await pool.query(
+          `SELECT rt.id, rt."driverId", rt."driverName", rt."vehicleId", rt.stops,
+                  rt."distKm", rt."durMins", rt.cities, rt."createdAt",
+                  d.status AS "deliveryStatus", d.id AS "deliveryId", d.eta
+           FROM "Routes" rt
+           LEFT JOIN "Deliveries" d ON d."driverId"=rt."driverId"
+           ORDER BY rt."createdAt" DESC`
+        );
+      }
     }
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Driver's own routes endpoint — returns full route records for this driver
+// Driver's own routes endpoint — resilient fallback if new columns don't exist yet
 app.get('/api/routes/my', auth, async (req, res) => {
   const { driverId } = req.query;
   if (!driverId) return res.status(400).json({ error: 'driverId required' });
   try {
-    const r = await pool.query(
-      `SELECT * FROM "Routes" WHERE "driverId"=$1 ORDER BY "createdAt" DESC`,
+    // Try to fetch published routes (with new columns)
+    let routes = [];
+    try {
+      const r = await pool.query(
+        `SELECT id,"driverId","driverName","vehicleId",stops,"distKm","durMins",cities,
+                "stops_data","routeDate","depart","routeNotes","createdAt"
+         FROM "Routes" WHERE "driverId"=$1 ORDER BY "createdAt" DESC`,
+        [driverId]
+      );
+      routes = r.rows;
+    } catch {
+      // New columns don't exist yet — fall back to base columns only
+      try {
+        const r = await pool.query(
+          `SELECT id,"driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt"
+           FROM "Routes" WHERE "driverId"=$1 ORDER BY "createdAt" DESC`,
+          [driverId]
+        );
+        routes = r.rows;
+      } catch { routes = []; }
+    }
+
+    // If published routes found, return them
+    if (routes.length > 0) return res.json(routes);
+
+    // ── FALLBACK: reconstruct a synthetic route from the driver's assigned deliveries ──
+    // This handles drivers who were quick-assigned before the route builder existed
+    const dels = await pool.query(
+      `SELECT d.id AS "deliveryId", d."vehicleId", d.eta, d.status,
+              o."retailerName" AS retailer, o.city, o.items, o.priority
+       FROM "Deliveries" d
+       JOIN "Orders" o ON d."orderId"=o.id
+       WHERE d."driverId"=$1
+       ORDER BY d."createdAt" ASC`,
       [driverId]
     );
-    res.json(r.rows);
+    if (!dels.rows.length) return res.json([]);
+
+    const delivs     = dels.rows;
+    const cities     = delivs.map(d => d.city);
+    const distKm     = Math.round(delivs.length * 40);
+    const durMins    = Math.round(distKm * 2.8);
+    const vehicleId  = delivs[0].vehicleId || '—';
+    const driverRow  = await pool.query('SELECT name FROM "Users" WHERE id=$1', [driverId]);
+    const driverName = driverRow.rows[0]?.name || 'Driver';
+
+    // Build stops_data so the frontend can render the full timeline
+    const stopsData = delivs.map(d => ({
+      deliveryId: d.deliveryId,
+      retailer:   d.retailer,
+      city:       d.city,
+      items:      d.items,
+      priority:   d.priority,
+      eta:        d.eta || '',
+      stopNote:   ''
+    }));
+
+    const syntheticRoute = {
+      id:           null,
+      driverId,
+      driverName,
+      vehicleId,
+      stops:        delivs.length,
+      distKm,
+      durMins,
+      cities:       JSON.stringify(cities),
+      stops_data:   JSON.stringify(stopsData),
+      routeDate:    null,
+      depart:       null,
+      routeNotes:   null,
+      createdAt:    new Date(),
+      _synthetic:   true   // flag so frontend knows this was auto-generated
+    };
+
+    return res.json([syntheticRoute]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
