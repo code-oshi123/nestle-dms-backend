@@ -13,6 +13,9 @@ const { Pool } = require('pg');
  *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "depart"      VARCHAR(10);
  *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "routeNotes"  TEXT;
  *
+ *  -- Delivery status update tracking (run once):
+ *  ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMPTZ;
+ *
  *  The API will fall back gracefully if these columns don't exist yet.
  */
 
@@ -554,42 +557,71 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
   if (!validStatuses.includes(newStatus)) {
     return res.status(400).json({ error: 'Invalid status value' });
   }
+  // Require a note/reason when marking as failed
+  if (newStatus === 'failed' && (!note || note.trim() === '')) {
+    return res.status(400).json({ error: 'A reason is required when marking a delivery as failed' });
+  }
   try {
-    await pool.query('UPDATE "Deliveries" SET status=$1 WHERE id=$2', [newStatus, req.params.id]);
+    // Prevent going backwards: delivered/failed are terminal
+    const cur = await pool.query('SELECT status FROM "Deliveries" WHERE id=$1', [req.params.id]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    const currentStatus = cur.rows[0].status;
+    if (['delivered', 'failed'].includes(currentStatus)) {
+      return res.status(409).json({ error: `Delivery is already "${currentStatus}" — status cannot be changed.` });
+    }
+
+    await pool.query(
+      'UPDATE "Deliveries" SET status=$1, "updatedAt"=NOW() WHERE id=$2',
+      [newStatus, req.params.id]
+    );
+
     const del = await pool.query(
-      `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city
+      `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city, o.items, o.kg
        FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
       [req.params.id]
     );
     const d = del.rows[0];
     if (d) {
-      const statusLabel = { 'in-transit':'In Transit 🚛', 'delivered':'Delivered ✅', 'failed':'Delivery Failed ❌' };
-      const msgType     = { 'in-transit':'info', 'delivered':'success', 'failed':'alert' };
+      const statusLabel = { 'in-transit': 'In Transit 🚛', 'delivered': 'Delivered ✅', 'failed': 'Delivery Failed ❌' };
+      const msgType     = { 'in-transit': 'info', 'delivered': 'success', 'failed': 'alert' };
+      const noteStr     = note && note.trim() ? ` Note: ${note.trim()}` : '';
+      const driverStr   = d.driverName ? ` Driver: ${d.driverName}.` : '';
 
-      // Notify retailer directly
+      // 1. Notify Retailer
+      const retailerMsg = newStatus === 'delivered'
+        ? `Great news! Your delivery ${req.params.id} to ${d.city} has been successfully delivered ✅.${noteStr}`
+        : newStatus === 'failed'
+        ? `Unfortunately, delivery ${req.params.id} to ${d.city} could not be completed ❌.${noteStr} Please contact us to reschedule.`
+        : `Your delivery ${req.params.id} to ${d.city} is now on its way 🚛.${driverStr} Expected arrival: ${d.eta || 'soon'}.${noteStr}`;
+
       await notify(
         d.retailerId,
-        `Delivery ${statusLabel[newStatus]||newStatus}`,
-        `Your delivery ${req.params.id} to ${d.city} is now "${newStatus}". ${note||''}`,
-        msgType[newStatus]||'info',
+        `Delivery ${statusLabel[newStatus] || newStatus}`,
+        retailerMsg,
+        msgType[newStatus] || 'info',
         req.params.id
       );
 
-      // Notify Order Team and Warehouse
+      // 2. Notify Order Team, Warehouse, and Route Planner
       const staff = await pool.query(
-        'SELECT id FROM "Users" WHERE role IN (\'order_team\', \'warehouse\')'
+        `SELECT id, role FROM "Users" WHERE role IN ('order_team', 'warehouse', 'route_planner')`
       );
       for (const u of staff.rows) {
+        const roleContext = u.role === 'warehouse'
+          ? (newStatus === 'delivered' ? ' Delivery bay can be cleared.' : newStatus === 'failed' ? ' May need to re-stock or re-schedule.' : '')
+          : u.role === 'route_planner'
+          ? (newStatus === 'delivered' ? ' Route stop complete.' : newStatus === 'failed' ? ' Consider re-routing or rescheduling.' : '')
+          : '';
         await notify(
           u.id,
-          `Delivery Update: ${statusLabel[newStatus]||newStatus}`,
-          `Delivery ${req.params.id} to ${d.city} (${d.retailer}) → "${newStatus}". ${note||''}`,
-          msgType[newStatus]||'info',
+          `Delivery Update: ${statusLabel[newStatus] || newStatus}`,
+          `Delivery ${req.params.id} → ${d.city} (${d.retailer}, ${d.items} items).${driverStr} Status: "${newStatus}".${noteStr}${roleContext}`,
+          msgType[newStatus] || 'info',
           req.params.id
         );
       }
     }
-    res.json({ ok: true });
+    res.json({ ok: true, newStatus, notified: ['retailer', 'order_team', 'warehouse', 'route_planner'] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
