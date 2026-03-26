@@ -159,7 +159,7 @@ async function checkStock(productId, items, kg) {
     if (items > s.availableUnits) {
       return { ok: false, reason: `Requested ${items} units but only ${s.availableUnits} in stock` };
     }
-    if (kg > s.availableKg) {
+    if (kg > 0 && kg > s.availableKg) {
       return { ok: false, reason: `Requested ${kg}kg but only ${s.availableKg}kg available` };
     }
     return { ok: true, productName: s.productName || null };
@@ -210,7 +210,7 @@ app.post('/api/orders', auth, async (req, res) => {
 
   // ── FIX: Validate inputs strictly ──
   const itemsNum = Number(items);
-  const kgNum    = Number(kg);
+  const kgNum    = kg != null ? Number(kg) : 0;   // kg is optional — retailer doesn't know weight
   const productIdNum = productId ? Number(productId) : 1;
 
   if (!city || city.trim() === '') {
@@ -218,9 +218,6 @@ app.post('/api/orders', auth, async (req, res) => {
   }
   if (!Number.isInteger(itemsNum) || itemsNum <= 0) {
     return res.status(400).json({ error: 'Items must be a positive whole number (no decimals or negatives)' });
-  }
-  if (typeof kgNum !== 'number' || isNaN(kgNum) || kgNum <= 0) {
-    return res.status(400).json({ error: 'Weight must be a positive number' });
   }
   if (!Number.isInteger(productIdNum) || productIdNum <= 0) {
     return res.status(400).json({ error: 'Product must be selected' });
