@@ -136,24 +136,14 @@ async function notify(userId, title, message, type='info', refId=null) {
 // ══════════════════════════════════════════════
 app.get('/api/drivers', auth, async (req, res) => {
   try {
-    let r;
-    try {
-      // Try joining on email first
-      r = await pool.query(`
-        SELECT d.*, u.id AS "userId"
-        FROM "Drivers" d
-        LEFT JOIN "Users" u ON lower(u."Email") = lower(d.email) AND u.role = 'distributor'
-        ORDER BY d.name
-      `);
-    } catch {
-      // No email column in Drivers -- join on name
-      r = await pool.query(`
-        SELECT d.*, u.id AS "userId"
-        FROM "Drivers" d
-        LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
-        ORDER BY d.name
-      `);
-    }
+    // Join on name to get Users.id (the correct userId for notifications).
+    // Drivers table has no email or userId column, name is the only shared key.
+    const r = await pool.query(`
+      SELECT d.id, d.name, d.phone, u.id AS "userId"
+      FROM "Drivers" d
+      LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
+      ORDER BY d.name
+    `);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
