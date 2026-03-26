@@ -3,18 +3,30 @@ const cors    = require('cors');
 const bcrypt  = require('bcrypt');
 const jwt     = require('jsonwebtoken');
 const { Pool } = require('pg');
-
+ 
+/*
+ * ── DB MIGRATION: Run these ALTER TABLE statements once to support the new
+ *    Route Planning feature (safe to run even if columns already exist):
+ *
+ *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "stops_data"  TEXT;
+ *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "routeDate"   DATE;
+ *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "depart"      VARCHAR(10);
+ *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "routeNotes"  TEXT;
+ *
+ *  The API will fall back gracefully if these columns don't exist yet.
+ */
+ 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
+ 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
-
+ 
 const JWT_SECRET = process.env.JWT_SECRET || 'nestle-dms-secret-change-in-prod';
-
+ 
 // ── Middleware: verify JWT token ──────────────
 function auth(req, res, next) {
   const header = req.headers['authorization'];
@@ -27,10 +39,10 @@ function auth(req, res, next) {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
-
+ 
 // ── health check / keep-alive ─────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Nestlé DMS API' }));
-
+ 
 // ══════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════
@@ -51,7 +63,7 @@ app.post('/api/login', async (req, res) => {
     res.json({ id: u.id, name: u.name, email: u.Email, role: u.role, avatar: u.avatar, token });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 // ══════════════════════════════════════════════
 // NOTIFICATIONS
 // ══════════════════════════════════════════════
@@ -68,7 +80,7 @@ app.get('/api/notifications', auth, async (req, res) => {
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.get('/api/notifications/unread', auth, async (req, res) => {
   const { userId } = req.query;
   try {
@@ -79,14 +91,14 @@ app.get('/api/notifications/unread', auth, async (req, res) => {
     res.json({ count: parseInt(r.rows[0].count) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/notifications/:id/read', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Notifications" SET "isRead"=true WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/notifications/read-all', auth, async (req, res) => {
   const { userId } = req.body;
   try {
@@ -94,14 +106,14 @@ app.put('/api/notifications/read-all', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 async function notify(userId, title, message, type='info', refId=null) {
   await pool.query(
     'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
     [userId, title, message, type, refId]
   );
 }
-
+ 
 // ══════════════════════════════════════════════
 // REFERENCE DATA
 // ══════════════════════════════════════════════
@@ -111,14 +123,14 @@ app.get('/api/drivers', auth, async (req, res) => {
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.get('/api/vehicles', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM "Vehicles" ORDER BY id');
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 // Returns available products (backed by the "Stock" table).
 app.get('/api/products', auth, async (req, res) => {
   try {
@@ -130,21 +142,21 @@ app.get('/api/products', auth, async (req, res) => {
       'SELECT id, productName     AS "productName" FROM "Stock" ORDER BY productName',
       'SELECT id, productname    AS "productName" FROM "Stock" ORDER BY productname',
     ];
-
+ 
     for (const q of queries) {
       try {
         const r = await pool.query(q);
         if (Array.isArray(r.rows)) return res.json(r.rows);
       } catch {}
     }
-
+ 
     return res.json([]);
   } catch (e) {
     // Stock table might not exist yet; keep frontend usable.
     return res.json([]);
   }
 });
-
+ 
 // ── Stock check helper ────────────────────────
 // Checks against a "Stock" table (id, productName, availableUnits, availableKg)
 // Falls back gracefully if table doesn't exist yet.
@@ -167,7 +179,7 @@ async function checkStock(productId, items, kg) {
     return { ok: true, productName: null }; // table might not exist — allow
   }
 }
-
+ 
 // ══════════════════════════════════════════════
 // ORDERS
 // ══════════════════════════════════════════════
@@ -193,7 +205,7 @@ app.get('/api/orders', auth, async (req, res) => {
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.post('/api/orders', auth, async (req, res) => {
   const {
     retailerId,
@@ -207,12 +219,12 @@ app.post('/api/orders', auth, async (req, res) => {
     productName,
     specifics
   } = req.body;
-
+ 
   // ── FIX: Validate inputs strictly ──
   const itemsNum = Number(items);
   const kgNum    = kg != null ? Number(kg) : 0;   // kg is optional — retailer doesn't know weight
   const productIdNum = productId ? Number(productId) : 1;
-
+ 
   if (!city || city.trim() === '') {
     return res.status(400).json({ error: 'City is required' });
   }
@@ -225,7 +237,7 @@ app.post('/api/orders', auth, async (req, res) => {
   if (!['normal','high','urgent'].includes(priority)) {
     return res.status(400).json({ error: 'Invalid priority value' });
   }
-
+ 
   // ── FIX: Stock availability check ──
   const stock = await checkStock(productIdNum, itemsNum, kgNum);
   const productLabel =
@@ -245,7 +257,7 @@ app.post('/api/orders', auth, async (req, res) => {
     } catch {}
     return res.status(422).json({ error: stock.reason, stockError: true });
   }
-
+ 
   try {
     const r = await pool.query(
       `INSERT INTO "Orders"("retailerId","retailerName",city,items,kg,priority,notes,status,"createdAt")
@@ -253,7 +265,7 @@ app.post('/api/orders', auth, async (req, res) => {
       [retailerId, retailerName, city, itemsNum, kgNum, priority, notes||'']
     );
     const orderId = r.rows[0].id;
-
+ 
     // Notify all Order Processing Team members
     const staff = await pool.query('SELECT id FROM "Users" WHERE role=\'order_team\'');
     for (const s of staff.rows) {
@@ -268,15 +280,15 @@ app.post('/api/orders', auth, async (req, res) => {
     res.json({ id: orderId });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/orders/:id/confirm', auth, async (req, res) => {
   const { action, confirmedBy, rejectReason } = req.body;
-
+ 
   // ── FIX: Require a reason when rejecting ──
   if (action === 'reject' && (!rejectReason || rejectReason.trim() === '')) {
     return res.status(400).json({ error: 'A rejection reason is required' });
   }
-
+ 
   const status = action === 'confirm' ? 'confirmed' : 'rejected';
   try {
     // Only allow action on pending orders
@@ -285,12 +297,12 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
     if (check.rows[0].status !== 'pending') {
       return res.status(400).json({ error: `Order is already "${check.rows[0].status}" — cannot change` });
     }
-
+ 
     await pool.query(
       'UPDATE "Orders" SET status=$1,"confirmedBy"=$2,"rejectReason"=$3 WHERE id=$4',
       [status, confirmedBy, rejectReason||null, req.params.id]
     );
-
+ 
     const order = await pool.query('SELECT * FROM "Orders" WHERE id=$1', [req.params.id]);
     const o = order.rows[0];
     if (o) {
@@ -305,7 +317,7 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
         action === 'confirm' ? 'success' : 'alert',
         o.id
       );
-
+ 
       // ── FIX: Also notify route_planner & warehouse when confirmed ──
       if (action === 'confirm') {
         const planners = await pool.query(
@@ -325,7 +337,7 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
     res.json({ ok: true, status });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 // ══════════════════════════════════════════════
 // DELIVERIES
 // ══════════════════════════════════════════════
@@ -350,17 +362,17 @@ app.get('/api/deliveries', auth, async (req, res) => {
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.post('/api/deliveries/consolidate', auth, async (req, res) => {
   try {
     const orders = await pool.query('SELECT * FROM "Orders" WHERE status=\'confirmed\'');
     const confirmed = orders.rows;
     if (!confirmed.length) return res.json({ created: 0, held: 0 });
-
+ 
     if (confirmed.length === 1 && !['urgent','high'].includes(confirmed[0].priority)) {
       return res.json({ created: 0, held: 1, reason: 'single_low_priority', orderId: confirmed[0].id });
     }
-
+ 
     let created = 0;
     for (const o of confirmed) {
       await pool.query(
@@ -370,7 +382,7 @@ app.post('/api/deliveries/consolidate', auth, async (req, res) => {
       await pool.query('UPDATE "Orders" SET status=\'consolidated\' WHERE id=$1', [o.id]);
       created++;
     }
-
+ 
     // ── FIX: Notify route_planner AND warehouse reliably ──
     const notifyUsers = await pool.query(
       'SELECT id, role FROM "Users" WHERE role IN (\'route_planner\', \'warehouse\')'
@@ -386,18 +398,25 @@ app.post('/api/deliveries/consolidate', auth, async (req, res) => {
         'info'
       );
     }
-
+ 
     res.json({ created });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
-  const { driverId, driverName, vehicleId } = req.body;
-  const etaDate = new Date(Date.now() + 2*60*60*1000);
-  const eta = etaDate.toLocaleTimeString('en-LK', { hour:'2-digit', minute:'2-digit' });
-
+  const { driverId, driverName, vehicleId, etaOverride, deliveryNotes } = req.body;
+ 
+  // Calculate ETA
+  let eta;
+  if (etaOverride) {
+    eta = etaOverride;
+  } else {
+    const etaDate = new Date(Date.now() + 2*60*60*1000);
+    eta = etaDate.toLocaleTimeString('en-LK', { hour:'2-digit', minute:'2-digit' });
+  }
+ 
   try {
-    // ── FIX: Block reassignment if route is already active (in-transit or completed) ──
+    // Block reassignment if locked
     const check = await pool.query('SELECT status, "driverId" AS "oldDriverId" FROM "Deliveries" WHERE id=$1', [req.params.id]);
     if (!check.rows.length) return res.status(404).json({ error: 'Delivery not found' });
     const current = check.rows[0];
@@ -405,8 +424,8 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
     if (lockedStatuses.includes(current.status)) {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
-
-    // If previously assigned to a different driver, notify old driver of de-assignment
+ 
+    // Notify old driver of de-assignment
     const oldDriverId = parseInt(current.oldDriverId);
     if (oldDriverId && oldDriverId !== parseInt(driverId)) {
       await notify(
@@ -417,64 +436,82 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
         req.params.id
       );
     }
-
+ 
     await pool.query(
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
-
-    // ── Auto-save/update route data to Routes table on assign ──
+ 
+    // Get full delivery + order details for notifications
     const del = await pool.query(
-      `SELECT d.*, o.city, o."retailerName" AS retailer, o.items, o.kg
+      `SELECT d.*, o.city, o."retailerName" AS retailer, o.items, o.kg, o.priority, o."retailerId"
        FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
       [req.params.id]
     );
     const d = del.rows[0];
+ 
     if (d) {
       const distKm  = Math.round(42 + Math.random() * 30);
       const durMins = Math.round(distKm * 2.8);
-      // Remove any old route for this delivery, then insert fresh
+ 
+      // Save / update route record
       await pool.query('DELETE FROM "Routes" WHERE "deliveryId"=$1', [req.params.id]).catch(()=>{});
+      const stopsData = JSON.stringify([{
+        deliveryId: req.params.id,
+        retailer:   d.retailer,
+        city:       d.city,
+        items:      d.items,
+        priority:   d.priority,
+        eta,
+        stopNote:   deliveryNotes || ''
+      }]);
       await pool.query(
-        `INSERT INTO "Routes"("deliveryId","driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-         ON CONFLICT DO NOTHING`,
-        [req.params.id, driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city])]
+        `INSERT INTO "Routes"("deliveryId","driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) ON CONFLICT DO NOTHING`,
+        [req.params.id, driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city]), stopsData]
       ).catch(async () => {
-        // Fallback if deliveryId column doesn't exist yet — just insert without it
+        // Fallback without deliveryId column
         await pool.query(
-          `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
-           VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
-          [driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city])]
-        );
+          `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","createdAt")
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
+          [driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city]), stopsData]
+        ).catch(async () => {
+          // Final fallback without stops_data
+          await pool.query(
+            `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
+             VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
+            [driverId, driverName, vehicleId, 1, distKm, durMins, JSON.stringify([d.city])]
+          );
+        });
       });
-    }
-
-    // ── FIX: Notify driver (driverId must be int) ──
-    await notify(
-      parseInt(driverId),
-      'New Delivery Assigned 🚚',
-      `You have been assigned delivery ${req.params.id} to ${d?.city||''}. Vehicle: ${vehicleId}. ETA: ${eta}. Check "My Routes" for full details.`,
-      'info',
-      req.params.id
-    );
-
-    // Notify all warehouse staff
-    const wh = await pool.query('SELECT id FROM "Users" WHERE role=\'warehouse\'');
-    for (const u of wh.rows) {
+ 
+      // Rich driver notification with full briefing
+      const notesLine = deliveryNotes ? `\nNotes: ${deliveryNotes}` : '';
       await notify(
-        u.id,
-        'Delivery Assigned — Prepare Cargo 📦',
-        `Delivery ${req.params.id} assigned to ${driverName} (vehicle ${vehicleId}). Please prepare cargo. ETA: ${eta}`,
+        parseInt(driverId),
+        '🚚 Delivery Assigned — Route Briefing',
+        `You have been assigned delivery ${req.params.id}.\n\nStop 1: ${d.city} — ${d.retailer} (${d.items} items)\nVehicle: ${vehicleId}\nETA: ${eta}\nDistance: ~${distKm} km${notesLine}\n\nCheck "My Route Briefing" for full details.`,
         'info',
         req.params.id
       );
+ 
+      // Notify warehouse
+      const wh = await pool.query('SELECT id FROM "Users" WHERE role=\'warehouse\'');
+      for (const u of wh.rows) {
+        await notify(
+          u.id,
+          'Delivery Assigned — Prepare Cargo 📦',
+          `Delivery ${req.params.id} assigned to ${driverName} (vehicle ${vehicleId}). Destination: ${d.city} — ${d.retailer}, ${d.items} items. ETA: ${eta}. Please prepare cargo.`,
+          'info',
+          req.params.id
+        );
+      }
     }
-
+ 
     res.json({ eta, driverName, vehicleId });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
@@ -492,7 +529,7 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
   try {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
@@ -510,7 +547,7 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.put('/api/deliveries/:id/status', auth, async (req, res) => {
   const { newStatus, note, updatedBy } = req.body;
   const validStatuses = ['in-transit', 'delivered', 'failed'];
@@ -528,7 +565,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
     if (d) {
       const statusLabel = { 'in-transit':'In Transit 🚛', 'delivered':'Delivered ✅', 'failed':'Delivery Failed ❌' };
       const msgType     = { 'in-transit':'info', 'delivered':'success', 'failed':'alert' };
-
+ 
       // Notify retailer directly
       await notify(
         d.retailerId,
@@ -537,7 +574,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
         msgType[newStatus]||'info',
         req.params.id
       );
-
+ 
       // Notify Order Team and Warehouse
       const staff = await pool.query(
         'SELECT id FROM "Users" WHERE role IN (\'order_team\', \'warehouse\')'
@@ -555,16 +592,130 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 // ══════════════════════════════════════════════
 // ROUTES
 // ══════════════════════════════════════════════
+ 
+// Publish a full multi-stop route plan
+app.post('/api/routes/publish', auth, async (req, res) => {
+  const { driverId, driverName, vehicleId, routeDate, depart, routeNotes, stops, distKm, durMins, cities } = req.body;
+ 
+  if (!driverId || !driverName || !vehicleId || !Array.isArray(stops) || !stops.length) {
+    return res.status(400).json({ error: 'driverId, driverName, vehicleId, and stops[] are required' });
+  }
+ 
+  try {
+    const stopsData = JSON.stringify(stops);
+    const citiesJson = JSON.stringify(cities || stops.map(s => s.city));
+ 
+    // Insert route record — try with all columns first, fall back gracefully
+    let routeId;
+    try {
+      const rr = await pool.query(
+        `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","routeDate","depart","routeNotes","createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) RETURNING id`,
+        [driverId, driverName, vehicleId, stops.length, distKm, durMins, citiesJson, stopsData, routeDate||null, depart||null, routeNotes||null]
+      );
+      routeId = rr.rows[0].id;
+    } catch {
+      // Fallback: insert without newer columns
+      const rr = await pool.query(
+        `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) RETURNING id`,
+        [driverId, driverName, vehicleId, stops.length, distKm, durMins, citiesJson]
+      );
+      routeId = rr.rows[0].id;
+    }
+ 
+    // Assign each delivery to this driver/vehicle and update status
+    const assignedDeliveryIds = [];
+    for (let i = 0; i < stops.length; i++) {
+      const s = stops[i];
+      const eta = s.eta || null;
+      try {
+        // Check the delivery is still pending / reassignable
+        const chk = await pool.query('SELECT status, "driverId" AS old FROM "Deliveries" WHERE id=$1', [s.deliveryId]);
+        if (!chk.rows.length) continue;
+        const cur = chk.rows[0];
+        if (['in-transit','delivered','failed'].includes(cur.status)) continue;
+ 
+        // Notify old driver if reassigned
+        const oldDriverId = parseInt(cur.old);
+        if (oldDriverId && oldDriverId !== parseInt(driverId)) {
+          await notify(oldDriverId,
+            'Delivery Reassigned ↩️',
+            `Delivery ${s.deliveryId} has been moved to a new route. It is no longer on your schedule.`,
+            'warning', s.deliveryId
+          );
+        }
+ 
+        await pool.query(
+          'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
+          [driverId, driverName, vehicleId, eta, s.deliveryId]
+        );
+        assignedDeliveryIds.push(s.deliveryId);
+      } catch (e) {
+        console.error('Stop assign error:', e.message);
+      }
+    }
+ 
+    // Build a rich route briefing for the driver notification
+    const stopLines = stops.map((s, i) =>
+      `  Stop ${i+1}: ${s.city} — ${s.retailer || ''} (${s.items || '?'} items)${s.eta ? ', ETA ' + s.eta : ''}${s.stopNote ? '\n    Note: ' + s.stopNote : ''}`
+    ).join('\n');
+    const summaryLine = `${stops.length} stops · ~${distKm} km · ~${Math.floor(durMins/60)}h ${durMins%60}m`;
+    const dateLine    = routeDate ? `Date: ${routeDate}` : '';
+    const departLine  = depart    ? `Depot departure: ${depart}` : '';
+ 
+    await notify(
+      parseInt(driverId),
+      `🗺️ Route Plan Published — ${stops.length} Stops`,
+      `Your route has been planned and published.\n\n${dateLine}${dateLine&&departLine?'\n':''}${departLine}\nVehicle: ${vehicleId}\n${summaryLine}\n\nStop Sequence:\n${stopLines}${routeNotes ? '\n\nRoute Notes: ' + routeNotes : ''}\n\nCheck "My Route Briefing" for the full plan.`,
+      'info',
+      String(routeId)
+    );
+ 
+    // Notify warehouse with full stop list
+    const wh = await pool.query('SELECT id FROM "Users" WHERE role=\'warehouse\'');
+    for (const u of wh.rows) {
+      await notify(
+        u.id,
+        `📦 Route Published — ${stops.length} Stops to Prepare`,
+        `Route #${routeId} published for ${driverName} (vehicle ${vehicleId}).\nStops: ${stops.map((s,i)=>`${i+1}. ${s.city} — ${s.retailer||''}`).join(' | ')}\nPlease prepare and load cargo for all ${stops.length} stops before ${depart||'departure'}.`,
+        'info',
+        String(routeId)
+      );
+    }
+ 
+    // Notify each retailer their delivery is scheduled
+    for (const s of stops) {
+      try {
+        const delRow = await pool.query(
+          `SELECT o."retailerId" FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
+          [s.deliveryId]
+        );
+        if (delRow.rows.length) {
+          await notify(
+            delRow.rows[0].retailerId,
+            '🚚 Your Delivery is Scheduled',
+            `Your delivery ${s.deliveryId} to ${s.city} has been scheduled. Driver: ${driverName}, Vehicle: ${vehicleId}.${s.eta ? ' Expected arrival: ' + s.eta + '.' : ''} You will be notified when the driver is en route.`,
+            'info',
+            s.deliveryId
+          );
+        }
+      } catch {}
+    }
+ 
+    res.json({ id: routeId, assignedDeliveries: assignedDeliveryIds.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+ 
 app.get('/api/routes', auth, async (req, res) => {
   const { driverId } = req.query;
   try {
     let r;
     if (driverId) {
-      // ── FIX: Driver fetches their own routes with delivery details ──
       r = await pool.query(
         `SELECT rt.*, d.status AS deliveryStatus, d.eta,
                 o."retailerName" AS retailer, o.city AS orderCity, o.items, o.kg
@@ -586,29 +737,20 @@ app.get('/api/routes', auth, async (req, res) => {
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// ── FIX: Dedicated driver route endpoint — clean and simple ──
+ 
+// Driver's own routes endpoint — returns full route records for this driver
 app.get('/api/routes/my', auth, async (req, res) => {
   const { driverId } = req.query;
   if (!driverId) return res.status(400).json({ error: 'driverId required' });
   try {
-    // Get today's active deliveries for this driver with route info
     const r = await pool.query(
-      `SELECT d.id, d.status, d.eta, d."driverName", d."vehicleId",
-              o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio,
-              rt.id AS routeId, rt."distKm", rt."durMins", rt.cities, rt.stops
-       FROM "Deliveries" d
-       JOIN "Orders" o ON d."orderId"=o.id
-       LEFT JOIN "Routes" rt ON rt."driverId"=d."driverId"
-         AND rt.cities::text LIKE '%' || o.city || '%'
-       WHERE d."driverId"=$1
-       ORDER BY d."createdAt" DESC`,
+      `SELECT * FROM "Routes" WHERE "driverId"=$1 ORDER BY "createdAt" DESC`,
       [driverId]
     );
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+ 
 app.post('/api/routes', auth, async (req, res) => {
   const { driverId, driverName, vehicleId, stops, distKm, durMins, cities } = req.body;
   try {
@@ -622,7 +764,7 @@ app.post('/api/routes', auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
+ 
 // ══════════════════════════════════════════════
 // START
 // ══════════════════════════════════════════════
