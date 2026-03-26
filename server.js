@@ -130,7 +130,12 @@ async function notify(userId, title, message, type='info', refId=null) {
 // ══════════════════════════════════════════════
 app.get('/api/drivers', auth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM "Drivers" ORDER BY name');
+    const r = await pool.query(`
+      SELECT d.*, u.id AS "userId"
+      FROM "Drivers" d
+      LEFT JOIN "Users" u ON u."Email" = d.email AND u.role = 'distributor'
+      ORDER BY d.name
+    `);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
