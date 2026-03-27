@@ -53,9 +53,9 @@ app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
-    // Match by Email OR by name (username) — case-insensitive
+    // Accept login by Email OR by name (username) — case-insensitive
     const r = await pool.query(
-      'SELECT * FROM "Users" WHERE lower("Email")=lower($1) OR lower(name)=lower($1)',
+      'SELECT * FROM "Users" WHERE lower(\"Email\")=lower($1) OR lower(name)=lower($1)',
       [email.trim()]
     );
     if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
@@ -933,7 +933,80 @@ app.post('/api/routes', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
+// ══════════════════════════════════════════════
+// RETAILER MANAGEMENT (order_team only)
+// ══════════════════════════════════════════════
+
+function orderTeamOnly(req, res, next) {
+  if (!['order_team','admin'].includes(req.user?.role)) {
+    return res.status(403).json({ error: 'Order Team access required' });
+  }
+  next();
+}
+
+// GET /api/retailers — list all retailer accounts
+app.get('/api/retailers', auth, orderTeamOnly, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, "Email", avatar,
+       TO_CHAR("createdAt", 'DD Mon YYYY') AS "createdAt"
+       FROM "Users" WHERE role='retailer' ORDER BY name`
+    );
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/retailers — create a new retailer account
+app.post('/api/retailers', auth, orderTeamOnly, async (req, res) => {
+  const { name, email, password, avatar } = req.body;
+  if (!name || !name.trim())   return res.status(400).json({ error: 'Name is required' });
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required' });
+  if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  try {
+    const exists = await pool.query('SELECT id FROM "Users" WHERE lower("Email")=lower($1)', [email]);
+    if (exists.rows.length) return res.status(409).json({ error: `Email ${email} is already registered` });
+    const hash = await bcrypt.hash(password, 10);
+    const initials = (avatar && avatar.trim())
+      ? avatar.trim().toUpperCase().slice(0, 2)
+      : name.trim().split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+    const r = await pool.query(
+      `INSERT INTO "Users"(name, "Email", "PasswordHash", role, avatar, "createdAt")
+       VALUES($1,$2,$3,'retailer',$4,NOW()) RETURNING id, name, "Email", role, avatar`,
+      [name.trim(), email.trim(), hash, initials]
+    );
+    res.json({ ok: true, user: r.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/retailers/:id — remove a retailer account
+app.delete('/api/retailers/:id', auth, orderTeamOnly, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `DELETE FROM "Users" WHERE id=$1 AND role='retailer' RETURNING id, name`,
+      [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Retailer not found' });
+    res.json({ ok: true, deleted: r.rows[0].name });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/retailers/:id/reset-password — reset retailer password
+app.put('/api/retailers/:id/reset-password', auth, orderTeamOnly, async (req, res) => {
+  const { password } = req.body;
+  if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const r = await pool.query(
+      `UPDATE "Users" SET "PasswordHash"=$1 WHERE id=$2 AND role='retailer' RETURNING id`,
+      [hash, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Retailer not found' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // START
 // ══════════════════════════════════════════════
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Nestlé DMS API running on port ${PORT}`));
