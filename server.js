@@ -114,22 +114,6 @@ app.put('/api/notifications/:id/read', auth, async (req, res) => {
 });
 
 // FIX Bug 2: wrapped in try/catch so a DB error here never crashes the calling endpoint
-async function notify(userId, title, message, type='info', refId=null) {
-  if (!userId || isNaN(Number(userId))) {
-    console.error('[notify] SKIPPED - invalid userId:', userId);
-    return;
-  }
-  try {
-    await pool.query(
-      'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
-      [userId, title, message, type, refId]
-    );
-  } catch (e) {
-    console.error('[notify] FAILED for userId=' + userId + ':', e.message);
-  }
-}
-
-// Resolves Drivers.id -> Users.id for correct notification routing.
 async function driverUserId(driversId) {
   if (!driversId) return null;
   try {
@@ -141,9 +125,17 @@ async function driverUserId(driversId) {
        WHERE d.id = $1`, [driversId]
     );
     return r2.rows[0]?.id || null;
+  } catch (e) { console.error('[driverUserId]', e.message); return null; }
+}
+
+async function notify(userId, title, message, type='info', refId=null) {
+  try {
+    await pool.query(
+      'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
+      [userId, title, message, type, refId]
+    );
   } catch (e) {
-    console.error('[driverUserId] lookup failed:', e.message);
-    return null;
+    console.error('[notify] Failed for user ' + userId + ':', e.message);
   }
 }
 
@@ -152,8 +144,16 @@ async function driverUserId(driversId) {
 // ══════════════════════════════════════════════
 app.get('/api/drivers', auth, async (req, res) => {
   try {
+    // Join Users to get correct userId for notification routing
+    // Also flag drivers who are currently busy (have an active incomplete delivery)
     const r = await pool.query(`
-      SELECT d.id, d.name, d.phone, u.id AS "userId"
+      SELECT d.id, d.name, d.phone,
+             u.id AS "userId",
+             CASE WHEN EXISTS (
+               SELECT 1 FROM "Deliveries" del
+               WHERE del."driverId" = d.id
+                 AND del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+             ) THEN true ELSE false END AS busy
       FROM "Drivers" d
       LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
       ORDER BY d.name
@@ -164,7 +164,23 @@ app.get('/api/drivers', auth, async (req, res) => {
 
 app.get('/api/vehicles', auth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM "Vehicles" ORDER BY id');
+    // Flag vehicles that are already active and show remaining capacity
+    const r = await pool.query(`
+      SELECT v.*,
+             COALESCE((
+               SELECT SUM(o.kg) FROM "Deliveries" d
+               JOIN "Orders" o ON d."orderId" = o.id
+               WHERE d."vehicleId" = v.id
+                 AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')
+             ), 0) AS "loadedKg",
+             CASE WHEN EXISTS (
+               SELECT 1 FROM "Deliveries" d2
+               WHERE d2."vehicleId" = v.id
+                 AND d2.status IN ('assigned','warehouse_ready','loaded','in-transit')
+             ) THEN true ELSE false END AS busy
+      FROM "Vehicles" v
+      ORDER BY v.id
+    `);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -370,17 +386,6 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             o.id
           );
         }
-        // Notify driver if already assigned to a delivery for this order
-        try {
-          const dRow = await pool.query(
-            'SELECT "driverId" FROM "Deliveries" WHERE "orderId"=$1 AND "driverId" IS NOT NULL LIMIT 1',
-            [o.id]
-          );
-          if (dRow.rows[0]?.driverId) {
-            const dUid = await driverUserId(Number(dRow.rows[0].driverId));
-            if (dUid) await notify(dUid, 'Order Confirmed ✅ — Your Delivery', `Order ${o.id} to ${o.city} for ${o.retailerName} has been confirmed. Your delivery will proceed as planned.`, 'success', o.id);
-          }
-        } catch {}
       }
     }
     res.json({ ok: true, status });
@@ -448,18 +453,6 @@ app.post('/api/deliveries/consolidate', auth, async (req, res) => {
       );
     }
 
-    // Notify any drivers already assigned to these consolidated deliveries
-    try {
-      const dRows = await pool.query(
-        `SELECT DISTINCT d."driverId", o."retailerName", o.city, o.items, d.id AS "deliveryId"
-         FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
-         WHERE o.status='consolidated' AND d."driverId" IS NOT NULL`
-      );
-      for (const row of dRows.rows) {
-        const dUid = await driverUserId(Number(row.driverId));
-        if (dUid) await notify(dUid, '📦 Your Delivery Has Been Processed', `Your delivery to ${row.city} for ${row.retailerName} (${row.items} items) is ready for route planning. Check your route briefing.`, 'info', row.deliveryId);
-      }
-    } catch {}
     res.json({ created });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -486,22 +479,77 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
 
-    // Notify old driver of de-assignment
-    const oldDriverId = parseInt(current.oldDriverId);
-    if (oldDriverId && oldDriverId !== parseInt(driverId)) {
-      await notify(
-        oldDriverId,
-        'Delivery Reassigned ↩️',
-        `Delivery ${req.params.id} has been reassigned to another driver. It has been removed from your route.`,
-        'warning',
-        req.params.id
-      );
+    // Block: driver already has an active incomplete delivery
+    const driverBusy = await pool.query(
+      `SELECT id FROM "Deliveries"
+       WHERE "driverId"=$1 AND id != $2
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+       LIMIT 1`,
+      [driverId, req.params.id]
+    );
+    if (driverBusy.rows.length) {
+      return res.status(409).json({
+        error: `Driver ${driverName} has not completed delivery #${driverBusy.rows[0].id}. Finish or reassign that delivery before assigning a new one.`
+      });
     }
 
+    // Block: vehicle already active on a different delivery
+    const vehicleBusy = await pool.query(
+      `SELECT "driverName" FROM "Deliveries"
+       WHERE "vehicleId"=$1 AND id != $2
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+       LIMIT 1`,
+      [vehicleId, req.params.id]
+    );
+    if (vehicleBusy.rows.length) {
+      return res.status(409).json({
+        error: `Vehicle ${vehicleId} is currently in use by driver ${vehicleBusy.rows[0].driverName}. It cannot be assigned until their delivery is completed.`
+      });
+    }
+
+    // Block: vehicle capacity exceeded
+    const thisKgRow = await pool.query(
+      `SELECT COALESCE(o.kg, 0) AS kg FROM "Deliveries" d
+       JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
+      [req.params.id]
+    );
+    const thisKg = parseFloat(thisKgRow.rows[0]?.kg) || 0;
+    const capRow = await pool.query('SELECT cap FROM "Vehicles" WHERE id=$1', [vehicleId]);
+    if (capRow.rows.length) {
+      const cap = parseFloat(capRow.rows[0].cap) || 0;
+      if (cap > 0) {
+        const loadedRow = await pool.query(
+          `SELECT COALESCE(SUM(o.kg), 0) AS total
+           FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+           WHERE d."vehicleId"=$1 AND d.id != $2
+             AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')`,
+          [vehicleId, req.params.id]
+        );
+        const usedKg = parseFloat(loadedRow.rows[0].total) || 0;
+        if (usedKg + thisKg > cap) {
+          return res.status(409).json({
+            error: `Vehicle ${vehicleId} overloaded. Capacity: ${cap}kg, Already loaded: ${usedKg}kg, This delivery: ${thisKg}kg. Total would be ${usedKg + thisKg}kg. Choose a different vehicle.`
+          });
+        }
+      }
+    }
+
+    // Update DB first, then notify old driver (so removal is committed before notifying)
+    const oldDriverId = parseInt(current.oldDriverId);
     await pool.query(
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
+
+    // Notify removed driver after DB is updated
+    if (oldDriverId && oldDriverId !== parseInt(driverId)) {
+      const oldUid = await driverUserId(oldDriverId);
+      if (oldUid) {
+        await notify(oldUid, 'Delivery Reassigned ↩️',
+          `Delivery ${req.params.id} has been reassigned to another driver. It has been removed from your route.`,
+          'warning', req.params.id);
+      }
+    }
 
     // Get full delivery + order details for notifications
     const del = await pool.query(
@@ -548,9 +596,9 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
 
       // Rich driver notification with full briefing
       const notesLine = deliveryNotes ? `\nNotes: ${deliveryNotes}` : '';
-      const assignDriverUid = await driverUserId(parseInt(driverId));
+      const _assignUid = await driverUserId(parseInt(driverId));
       await notify(
-        assignDriverUid,
+        _assignUid,
         '🚚 Delivery Assigned — Route Briefing',
         `You have been assigned delivery ${req.params.id}.\n\nStop 1: ${d.city} — ${d.retailer} (${d.items} items)\nVehicle: ${vehicleId}\nETA: ${eta}\nDistance: ~${distKm} km${notesLine}\n\nCheck "My Route Briefing" for full details.`,
         'info',
@@ -579,7 +627,7 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdWR = d && d.driverId ? await driverUserId(Number(d.driverId)) : null;
+    const driverIdWR = d && d.driverId ? Number(d.driverId) : null;
     if (driverIdWR) {
       await notify(
         driverIdWR,
@@ -600,7 +648,7 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdL = d && d.driverId ? await driverUserId(Number(d.driverId)) : null;
+    const driverIdL = d && d.driverId ? Number(d.driverId) : null;
     if (driverIdL) {
       await notify(
         driverIdL,
@@ -685,7 +733,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
       }
 
       // 3. Notify the distributor (driver) — FIXED: Number() cast
-      const driverId = d.driverId ? await driverUserId(Number(d.driverId)) : null;
+      const driverId = d.driverId ? Number(d.driverId) : null;
       if (driverId) {
         const driverMsg = newStatus === 'delivered'
           ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) confirmed as delivered ✅. Check your route for remaining stops.`
@@ -718,6 +766,33 @@ app.post('/api/routes/publish', auth, async (req, res) => {
   }
 
   try {
+    // Block: driver already has an active incomplete delivery
+    const driverBusyPub = await pool.query(
+      `SELECT id FROM "Deliveries"
+       WHERE "driverId"=$1 AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+       LIMIT 1`,
+      [driverId]
+    );
+    if (driverBusyPub.rows.length) {
+      return res.status(409).json({
+        error: `Driver ${driverName} has not completed delivery #${driverBusyPub.rows[0].id}. Finish or reassign that delivery before publishing a new route.`
+      });
+    }
+
+    // Block: vehicle already active on another delivery for a different driver
+    const vehicleBusyPub = await pool.query(
+      `SELECT "driverName" FROM "Deliveries"
+       WHERE "vehicleId"=$1 AND "driverId" != $2
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+       LIMIT 1`,
+      [vehicleId, driverId]
+    );
+    if (vehicleBusyPub.rows.length) {
+      return res.status(409).json({
+        error: `Vehicle ${vehicleId} is currently in use by driver ${vehicleBusyPub.rows[0].driverName}. Choose a different vehicle.`
+      });
+    }
+
     const stopsData = JSON.stringify(stops);
     const citiesJson = JSON.stringify(cities || stops.map(s => s.city));
 
