@@ -114,6 +114,20 @@ app.put('/api/notifications/:id/read', auth, async (req, res) => {
 });
 
 // FIX Bug 2: wrapped in try/catch so a DB error here never crashes the calling endpoint
+async function driverUserId(driversId) {
+  if (!driversId) return null;
+  try {
+    const r1 = await pool.query('SELECT "userId" FROM "Drivers" WHERE id=$1', [driversId]);
+    if (r1.rows[0]?.userId) return r1.rows[0].userId;
+    const r2 = await pool.query(
+      `SELECT u.id FROM "Drivers" d
+       JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
+       WHERE d.id = $1`, [driversId]
+    );
+    return r2.rows[0]?.id || null;
+  } catch (e) { console.error('[driverUserId] lookup failed:', e.message); return null; }
+}
+
 async function notify(userId, title, message, type='info', refId=null) {
   try {
     await pool.query(
@@ -343,17 +357,6 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             o.id
           );
         }
-        // Notify driver if already assigned to a delivery for this order
-        try {
-          const dRow = await pool.query(
-            'SELECT "driverId" FROM "Deliveries" WHERE "orderId"=$1 AND "driverId" IS NOT NULL LIMIT 1',
-            [o.id]
-          );
-          if (dRow.rows[0]?.driverId) {
-            const dUid = await driverUserId(Number(dRow.rows[0].driverId));
-            if (dUid) await notify(dUid, 'Order Confirmed ✅ — Your Delivery', `Order ${o.id} to ${o.city} for ${o.retailerName} has been confirmed by the order team. Your delivery will proceed as planned.`, 'success', o.id);
-          }
-        } catch {}
       }
     }
     res.json({ ok: true, status });
@@ -421,18 +424,6 @@ app.post('/api/deliveries/consolidate', auth, async (req, res) => {
       );
     }
 
-    // Notify any drivers already assigned to these newly consolidated deliveries
-    try {
-      const dRows = await pool.query(
-        `SELECT DISTINCT d."driverId", o."retailerName", o.city, o.items, d.id AS "deliveryId"
-         FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
-         WHERE o.status='consolidated' AND d."driverId" IS NOT NULL`
-      );
-      for (const row of dRows.rows) {
-        const dUid = await driverUserId(Number(row.driverId));
-        if (dUid) await notify(dUid, '📦 Your Delivery Has Been Processed', `Your delivery to ${row.city} for ${row.retailerName} (${row.items} items) is ready for route planning. Check your route briefing for updates.`, 'info', row.deliveryId);
-      }
-    } catch {}
     res.json({ created });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -459,22 +450,71 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
 
-    // Notify old driver of de-assignment
-    const oldDriverId = parseInt(current.oldDriverId);
-    if (oldDriverId && oldDriverId !== parseInt(driverId)) {
-      await notify(
-        oldDriverId,
-        'Delivery Reassigned ↩️',
-        `Delivery ${req.params.id} has been reassigned to another driver. It has been removed from your route.`,
-        'warning',
-        req.params.id
-      );
+    // BUG 3 FIX: Block assigning the same driver to two active deliveries simultaneously
+    const driverConflict = await pool.query(
+      `SELECT id FROM "Deliveries"
+       WHERE "driverId"=$1 AND id != $2 AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+       LIMIT 1`,
+      [driverId, req.params.id]
+    );
+    if (driverConflict.rows.length) {
+      return res.status(409).json({ error: `Driver ${driverName} is already assigned to delivery #${driverConflict.rows[0].id} which is still active. Complete or reassign that delivery first.` });
     }
 
+    // BUG 4 FIX: Check vehicle capacity — sum kg of all active deliveries on this vehicle
+    const thisDelivery = await pool.query(
+      `SELECT o.kg FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
+      [req.params.id]
+    );
+    const thisKg = thisDelivery.rows[0]?.kg || 0;
+    const vehicleRow = await pool.query('SELECT cap FROM "Vehicles" WHERE id=$1', [vehicleId]);
+    if (vehicleRow.rows.length) {
+      const cap = parseFloat(vehicleRow.rows[0].cap) || 0;
+      if (cap > 0) {
+        const loadedKg = await pool.query(
+          `SELECT COALESCE(SUM(o.kg),0) AS total
+           FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+           WHERE d."vehicleId"=$1 AND d.id != $2 AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')`,
+          [vehicleId, req.params.id]
+        );
+        const usedKg = parseFloat(loadedKg.rows[0].total) || 0;
+        if (usedKg + thisKg > cap) {
+          return res.status(409).json({ error: `Vehicle ${vehicleId} capacity exceeded. Capacity: ${cap}kg, Already loaded: ${usedKg}kg, This delivery: ${thisKg}kg. Choose a different vehicle or reduce load.` });
+        }
+      }
+    }
+
+    // BUG 5 FIX: Block same vehicle being assigned to two different drivers simultaneously
+    const vehicleConflict = await pool.query(
+      `SELECT "driverId","driverName" FROM "Deliveries"
+       WHERE "vehicleId"=$1 AND id != $2 AND "driverId" != $3 AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+       LIMIT 1`,
+      [vehicleId, req.params.id, driverId]
+    );
+    if (vehicleConflict.rows.length && vehicleConflict.rows[0].driverName !== driverName) {
+      return res.status(409).json({ error: `Vehicle ${vehicleId} is already assigned to driver ${vehicleConflict.rows[0].driverName} for another active delivery. Choose a different vehicle.` });
+    }
+
+    // BUG 6 FIX: Update DB FIRST, then notify old driver (so removal is already committed)
+    const oldDriverId = parseInt(current.oldDriverId);
     await pool.query(
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
+
+    // Now notify old driver AFTER DB is updated (reassignment is real before notification)
+    if (oldDriverId && oldDriverId !== parseInt(driverId)) {
+      const oldUid = await driverUserId(oldDriverId);
+      if (oldUid) {
+        await notify(
+          oldUid,
+          'Delivery Reassigned ↩️',
+          `Delivery ${req.params.id} has been reassigned to another driver. It has been removed from your route.`,
+          'warning',
+          req.params.id
+        );
+      }
+    }
 
     // Get full delivery + order details for notifications
     const del = await pool.query(
@@ -521,8 +561,9 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
 
       // Rich driver notification with full briefing
       const notesLine = deliveryNotes ? `\nNotes: ${deliveryNotes}` : '';
+      const assignUid = await driverUserId(parseInt(driverId));
       await notify(
-        parseInt(driverId),
+        assignUid,
         '🚚 Delivery Assigned — Route Briefing',
         `You have been assigned delivery ${req.params.id}.\n\nStop 1: ${d.city} — ${d.retailer} (${d.items} items)\nVehicle: ${vehicleId}\nETA: ${eta}\nDistance: ~${distKm} km${notesLine}\n\nCheck "My Route Briefing" for full details.`,
         'info',
