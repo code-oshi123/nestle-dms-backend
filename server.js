@@ -1,30 +1,3 @@
-/*
- * ── SPRINT 1 DB MIGRATIONS: Run these once in Neon before deploying ──
- *
- *  -- Core columns (safe to re-run):
- *  ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "updatedAt"  TIMESTAMPTZ;
- *  ALTER TABLE "Routes"     ADD COLUMN IF NOT EXISTS "stops_data" TEXT;
- *  ALTER TABLE "Routes"     ADD COLUMN IF NOT EXISTS "routeDate"  DATE;
- *  ALTER TABLE "Routes"     ADD COLUMN IF NOT EXISTS "depart"     VARCHAR(10);
- *  ALTER TABLE "Routes"     ADD COLUMN IF NOT EXISTS "routeNotes" TEXT;
- *
- *  -- Driver <-> User link (fixes notification routing permanently):
- *  ALTER TABLE "Drivers" ADD COLUMN IF NOT EXISTS "userId" INTEGER REFERENCES "Users"(id);
- *  UPDATE "Drivers" d SET "userId" = u.id
- *    FROM "Users" u WHERE lower(u.name) = lower(d.name) AND u.role = 'distributor';
- *
- *  -- Status history (replaces phone-call tracking, Sprint 1 audit trail):
- *  CREATE TABLE IF NOT EXISTS "StatusHistory" (
- *    id           SERIAL PRIMARY KEY,
- *    "deliveryId" INTEGER NOT NULL REFERENCES "Deliveries"(id) ON DELETE CASCADE,
- *    status       VARCHAR(30) NOT NULL,
- *    note         TEXT,
- *    "updatedBy"  VARCHAR(100),
- *    "createdAt"  TIMESTAMPTZ DEFAULT NOW()
- *  );
- *  CREATE INDEX IF NOT EXISTS idx_statushistory_delivery ON "StatusHistory"("deliveryId");
- */
-
 const express = require('express');
 const cors    = require('cors');
 const bcrypt  = require('bcrypt');
@@ -142,143 +115,22 @@ app.put('/api/notifications/:id/read', auth, async (req, res) => {
 
 // FIX Bug 2: wrapped in try/catch so a DB error here never crashes the calling endpoint
 async function notify(userId, title, message, type='info', refId=null) {
-  if (!userId || isNaN(Number(userId))) {
-    console.error('[notify] SKIPPED - invalid userId:', userId);
-    return;
-  }
   try {
     await pool.query(
       'INSERT INTO "Notifications"("userId","title","message","type","refId","isRead","createdAt") VALUES($1,$2,$3,$4,$5,false,NOW())',
       [userId, title, message, type, refId]
     );
   } catch (e) {
-    console.error('[notify] FAILED for userId=' + userId + ':', e.message);
-  }
-}
-
-// Resolves Drivers.id -> Users.id.
-// Uses userId FK column if populated, falls back to name join.
-async function driverUserId(driversId) {
-  if (!driversId) return null;
-  try {
-    const r1 = await pool.query('SELECT "userId" FROM "Drivers" WHERE id=$1', [driversId]);
-    if (r1.rows[0]?.userId) return r1.rows[0].userId;
-    const r2 = await pool.query(
-      `SELECT u.id FROM "Drivers" d
-       JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
-       WHERE d.id = $1`, [driversId]
-    );
-    return r2.rows[0]?.id || null;
-  } catch (e) {
-    console.error('[driverUserId] lookup failed:', e.message);
-    return null;
+    console.error('[notify] Failed for user ' + userId + ':', e.message);
   }
 }
 
 // ══════════════════════════════════════════════
-
-// ══════════════════════════════════════════════
-// GEO & ROUTE OPTIMISATION
-// ══════════════════════════════════════════════
-
-// Real lat/lng for Sri Lanka cities in this system
-const CITY_COORDS = {
-  'Colombo':      { lat: 6.9271,  lng: 79.8612 },
-  'Dehiwala':     { lat: 6.8513,  lng: 79.8656 },
-  'Nugegoda':     { lat: 6.8728,  lng: 79.8880 },
-  'Negombo':      { lat: 7.2084,  lng: 79.8358 },
-  'Kiribathgoda': { lat: 6.9820,  lng: 80.0100 },
-  'Kandy':        { lat: 7.2906,  lng: 80.6337 },
-  'Peradeniya':   { lat: 7.2677,  lng: 80.5960 },
-  'Galle':        { lat: 6.0535,  lng: 80.2210 },
-  'Matara':       { lat: 5.9549,  lng: 80.5550 },
-  'Jaffna':       { lat: 9.6615,  lng: 80.0255 },
-  'Ratnapura':    { lat: 6.6828,  lng: 80.4016 },
-  'Kurunegala':   { lat: 7.4863,  lng: 80.3647 },
-  'Depot':        { lat: 6.9271,  lng: 79.8612 },
-};
-
-// Haversine distance in km between two {lat,lng} points
-function haversineKm(a, b) {
-  const R = 6371;
-  const dLat = (b.lat - a.lat) * Math.PI / 180;
-  const dLng = (b.lng - a.lng) * Math.PI / 180;
-  const x = Math.sin(dLat/2) * Math.sin(dLat/2) +
-            Math.cos(a.lat * Math.PI / 180) * Math.cos(b.lat * Math.PI / 180) *
-            Math.sin(dLng/2) * Math.sin(dLng/2);
-  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
-}
-
-// Greedy nearest-neighbour TSP from depot
-// Returns optimised stop order + distance/fuel comparison vs original
-function nearestNeighbour(stops) {
-  const depot = CITY_COORDS['Depot'];
-  const pool  = stops.map((s, i) => ({ ...s, coords: CITY_COORDS[s.city] || depot, origIdx: i }));
-  const ordered = [];
-  let current = depot, totalKm = 0;
-
-  while (pool.length) {
-    let best = null, bestDist = Infinity, bestIdx = -1;
-    for (let i = 0; i < pool.length; i++) {
-      const d = haversineKm(current, pool[i].coords);
-      if (d < bestDist) { bestDist = d; best = pool[i]; bestIdx = i; }
-    }
-    totalKm += bestDist;
-    current = best.coords;
-    ordered.push(best);
-    pool.splice(bestIdx, 1);
-  }
-  totalKm += haversineKm(current, depot);
-  totalKm = Math.round(totalKm);
-
-  // Unoptimised (original) order distance
-  let origKm = 0, prev = depot;
-  for (const s of stops) {
-    const c = CITY_COORDS[s.city] || depot;
-    origKm += haversineKm(prev, c);
-    prev = c;
-  }
-  origKm += haversineKm(prev, depot);
-  origKm = Math.round(origKm);
-
-  const savingKm   = Math.max(0, origKm - totalKm);
-  const savingPct  = origKm > 0 ? Math.round((savingKm / origKm) * 100) : 0;
-  // Avg Sri Lanka delivery truck: 12L/100km
-  const fuelLitres = Math.round((totalKm  / 100) * 12 * 10) / 10;
-  const fuelSaved  = Math.round((savingKm / 100) * 12 * 10) / 10;
-
-  return { orderedStops: ordered, totalKm, origKm, savingKm, savingPct, fuelLitres, fuelSaved };
-}
-
-// POST /api/routes/optimize
-app.post('/api/routes/optimize', auth, (req, res) => {
-  const { stops } = req.body;
-  if (!Array.isArray(stops) || stops.length < 2) {
-    return res.json({ stops: stops || [], totalKm: 0, origKm: 0, savingKm: 0, savingPct: 0, fuelLitres: 0, fuelSaved: 0, durMins: 0 });
-  }
-  const r = nearestNeighbour(stops);
-  res.json({
-    stops:      r.orderedStops,
-    totalKm:    r.totalKm,
-    origKm:     r.origKm,
-    savingKm:   r.savingKm,
-    savingPct:  r.savingPct,
-    fuelLitres: r.fuelLitres,
-    fuelSaved:  r.fuelSaved,
-    durMins:    Math.round(r.totalKm * 2.8)
-  });
-});
-
 // REFERENCE DATA
 // ══════════════════════════════════════════════
 app.get('/api/drivers', auth, async (req, res) => {
   try {
-    const r = await pool.query(`
-      SELECT d.id, d.name, d.phone, u.id AS "userId"
-      FROM "Drivers" d
-      LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
-      ORDER BY d.name
-    `);
+    const r = await pool.query('SELECT * FROM "Drivers" ORDER BY name');
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -491,6 +343,17 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             o.id
           );
         }
+        // Notify driver if already assigned to a delivery for this order
+        try {
+          const dRow = await pool.query(
+            'SELECT "driverId" FROM "Deliveries" WHERE "orderId"=$1 AND "driverId" IS NOT NULL LIMIT 1',
+            [o.id]
+          );
+          if (dRow.rows[0]?.driverId) {
+            const dUid = await driverUserId(Number(dRow.rows[0].driverId));
+            if (dUid) await notify(dUid, 'Order Confirmed ✅ — Your Delivery', `Order ${o.id} to ${o.city} for ${o.retailerName} has been confirmed by the order team. Your delivery will proceed as planned.`, 'success', o.id);
+          }
+        } catch {}
       }
     }
     res.json({ ok: true, status });
@@ -558,6 +421,18 @@ app.post('/api/deliveries/consolidate', auth, async (req, res) => {
       );
     }
 
+    // Notify any drivers already assigned to these newly consolidated deliveries
+    try {
+      const dRows = await pool.query(
+        `SELECT DISTINCT d."driverId", o."retailerName", o.city, o.items, d.id AS "deliveryId"
+         FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+         WHERE o.status='consolidated' AND d."driverId" IS NOT NULL`
+      );
+      for (const row of dRows.rows) {
+        const dUid = await driverUserId(Number(row.driverId));
+        if (dUid) await notify(dUid, '📦 Your Delivery Has Been Processed', `Your delivery to ${row.city} for ${row.retailerName} (${row.items} items) is ready for route planning. Check your route briefing for updates.`, 'info', row.deliveryId);
+      }
+    } catch {}
     res.json({ created });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -610,8 +485,7 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
     const d = del.rows[0];
 
     if (d) {
-      const _coords1 = CITY_COORDS[d.city] || CITY_COORDS['Depot'];
-      const distKm  = Math.round(haversineKm(CITY_COORDS['Depot'], _coords1));
+      const distKm  = Math.round(42 + Math.random() * 30);
       const durMins = Math.round(distKm * 2.8);
 
       // Save / update route record
@@ -647,9 +521,8 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
 
       // Rich driver notification with full briefing
       const notesLine = deliveryNotes ? `\nNotes: ${deliveryNotes}` : '';
-      const assignDriverUid = await driverUserId(parseInt(driverId));
       await notify(
-        assignDriverUid,
+        parseInt(driverId),
         '🚚 Delivery Assigned — Route Briefing',
         `You have been assigned delivery ${req.params.id}.\n\nStop 1: ${d.city} — ${d.retailer} (${d.items} items)\nVehicle: ${vehicleId}\nETA: ${eta}\nDistance: ~${distKm} km${notesLine}\n\nCheck "My Route Briefing" for full details.`,
         'info',
@@ -678,7 +551,7 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdWR = d && d.driverId ? await driverUserId(Number(d.driverId)) : null;
+    const driverIdWR = d && d.driverId ? Number(d.driverId) : null;
     if (driverIdWR) {
       await notify(
         driverIdWR,
@@ -699,7 +572,7 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdL = d && d.driverId ? await driverUserId(Number(d.driverId)) : null;
+    const driverIdL = d && d.driverId ? Number(d.driverId) : null;
     if (driverIdL) {
       await notify(
         driverIdL,
@@ -736,12 +609,6 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
       'UPDATE "Deliveries" SET status=$1, "updatedAt"=NOW() WHERE id=$2',
       [newStatus, req.params.id]
     );
-    // Log status change for audit trail (replace phone-call tracking)
-    await pool.query(
-      `INSERT INTO "StatusHistory"("deliveryId","status","note","updatedBy","createdAt")
-       VALUES($1,$2,$3,$4,NOW()) ON CONFLICT DO NOTHING`,
-      [req.params.id, newStatus, note||null, updatedBy||null]
-    ).catch(() => {});  // Silently skip if table doesn't exist yet — run migration first
 
     const del = await pool.query(
       `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city, o.items, o.kg
@@ -790,7 +657,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
       }
 
       // 3. Notify the distributor (driver) — FIXED: Number() cast
-      const driverId = d.driverId ? await driverUserId(Number(d.driverId)) : null;
+      const driverId = d.driverId ? Number(d.driverId) : null;
       if (driverId) {
         const driverMsg = newStatus === 'delivered'
           ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) confirmed as delivered ✅. Check your route for remaining stops.`
@@ -811,44 +678,18 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// GET /api/deliveries/:id/history -- audit trail replacing phone call tracking
-app.get('/api/deliveries/:id/history', auth, async (req, res) => {
-  try {
-    const r = await pool.query(
-      `SELECT status, note, "updatedBy", TO_CHAR("createdAt",'DD Mon YYYY HH24:MI') AS time
-       FROM "StatusHistory" WHERE "deliveryId"=$1 ORDER BY "createdAt" ASC`,
-      [req.params.id]
-    );
-    res.json(r.rows);
-  } catch (e) {
-    res.json([]); // Table may not exist yet
-  }
-});
-
 // ROUTES
 // ══════════════════════════════════════════════
 
 // Publish a full multi-stop route plan
 app.post('/api/routes/publish', auth, async (req, res) => {
-  const { driverId, driverName, vehicleId, routeDate, depart, routeNotes, stops, cities } = req.body;
+  const { driverId, driverName, vehicleId, routeDate, depart, routeNotes, stops, distKm, durMins, cities } = req.body;
 
   if (!driverId || !driverName || !vehicleId || !Array.isArray(stops) || !stops.length) {
     return res.status(400).json({ error: 'driverId, driverName, vehicleId, and stops[] are required' });
   }
 
   try {
-    // Calculate real distance using haversine (not frontend estimate)
-    const depot = CITY_COORDS['Depot'];
-    let realDistKm = 0, prev = depot;
-    for (const s of stops) {
-      const c = CITY_COORDS[s.city] || depot;
-      realDistKm += haversineKm(prev, c);
-      prev = c;
-    }
-    realDistKm += haversineKm(prev, depot);
-    const distKm  = Math.round(realDistKm);
-    const durMins = Math.round(distKm * 2.8);
-
     const stopsData = JSON.stringify(stops);
     const citiesJson = JSON.stringify(cities || stops.map(s => s.city));
 
@@ -885,9 +726,8 @@ app.post('/api/routes/publish', auth, async (req, res) => {
 
         // Notify old driver if reassigned
         const oldDriverId = parseInt(cur.old);
-        const oldDriverUid = oldDriverId ? await driverUserId(oldDriverId) : null;
-        if (oldDriverUid && oldDriverId !== parseInt(driverId)) {
-          await notify(oldDriverUid,
+        if (oldDriverId && oldDriverId !== parseInt(driverId)) {
+          await notify(oldDriverId,
             'Delivery Reassigned ↩️',
             `Delivery ${s.deliveryId} has been moved to a new route. It is no longer on your schedule.`,
             'warning', s.deliveryId
@@ -912,9 +752,8 @@ app.post('/api/routes/publish', auth, async (req, res) => {
     const dateLine    = routeDate ? `Date: ${routeDate}` : '';
     const departLine  = depart    ? `Depot departure: ${depart}` : '';
 
-    const publishDriverUid = await driverUserId(parseInt(driverId));
     await notify(
-      publishDriverUid,
+      parseInt(driverId),
       `🗺️ Route Plan Published — ${stops.length} Stops`,
       `Your route has been planned and published.\n\n${dateLine}${dateLine&&departLine?'\n':''}${departLine}\nVehicle: ${vehicleId}\n${summaryLine}\n\nStop Sequence:\n${stopLines}${routeNotes ? '\n\nRoute Notes: ' + routeNotes : ''}\n\nCheck "My Route Briefing" for the full plan.`,
       'info',
@@ -1060,13 +899,7 @@ app.get('/api/routes/my', auth, async (req, res) => {
 
     const delivs     = dels.rows;
     const cities     = delivs.map(d => d.city);
-    // Real distance: sum haversine between consecutive cities
-    const _synCities = delivs.map(d => CITY_COORDS[d.city] || CITY_COORDS['Depot']);
-    let distKm = 0;
-    let _prev  = CITY_COORDS['Depot'];
-    for (const c of _synCities) { distKm += haversineKm(_prev, c); _prev = c; }
-    distKm += haversineKm(_prev, CITY_COORDS['Depot']);
-    distKm = Math.round(distKm);
+    const distKm     = Math.round(delivs.length * 40);
     const durMins    = Math.round(distKm * 2.8);
     const vehicleId  = delivs[0].vehicleId || '—';
     const driverRow  = await pool.query('SELECT name FROM "Users" WHERE id=$1', [driverId]);
