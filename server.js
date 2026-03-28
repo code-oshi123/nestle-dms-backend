@@ -151,7 +151,7 @@ app.get('/api/drivers', auth, async (req, res) => {
       SELECT d.id, d.name, d.phone, u.id AS "userId",
              CASE WHEN EXISTS (
                SELECT 1 FROM "Deliveries" del
-               WHERE del."driverId" = d.id
+               WHERE (del."driverId" = d.id OR del."driverId" = u.id)
                  AND del.status IN ('assigned','warehouse_ready','loaded','in-transit')
              ) THEN true ELSE false END AS busy
       FROM "Drivers" d
@@ -470,11 +470,24 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
 
-    // Block: driver has any incomplete delivery (assigned/warehouse_ready/loaded/in-transit)
+    // Block: driver has any incomplete delivery — check both Drivers.id and linked Users.id
     const driverBusy = await pool.query(
-      `SELECT id FROM "Deliveries"
-       WHERE "driverId"=$1 AND id != $2
-         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
+      `SELECT d.id FROM "Deliveries" d
+       WHERE d.id != $2
+         AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')
+         AND (
+           d."driverId" = $1
+           OR d."driverId" = (
+             SELECT u.id FROM "Users" u
+             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
+             WHERE dr.id = $1 AND u.role = 'distributor' LIMIT 1
+           )
+           OR $1 = (
+             SELECT u.id FROM "Users" u
+             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
+             WHERE dr.id = d."driverId" AND u.role = 'distributor' LIMIT 1
+           )
+         ) LIMIT 1`,
       [driverId, req.params.id]
     );
     if (driverBusy.rows.length) {
@@ -752,10 +765,23 @@ app.post('/api/routes/publish', auth, async (req, res) => {
   }
 
   try {
-    // Block: driver has any incomplete delivery
+    // Block: driver has any incomplete delivery — check both Drivers.id and linked Users.id
     const driverBusyPub = await pool.query(
-      `SELECT id FROM "Deliveries"
-       WHERE "driverId"=$1 AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
+      `SELECT d.id FROM "Deliveries" d
+       WHERE d.status IN ('assigned','warehouse_ready','loaded','in-transit')
+         AND (
+           d."driverId" = $1
+           OR d."driverId" = (
+             SELECT u.id FROM "Users" u
+             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
+             WHERE dr.id = $1 AND u.role = 'distributor' LIMIT 1
+           )
+           OR $1 = (
+             SELECT u.id FROM "Users" u
+             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
+             WHERE dr.id = d."driverId" AND u.role = 'distributor' LIMIT 1
+           )
+         ) LIMIT 1`,
       [driverId]
     );
     if (driverBusyPub.rows.length) {
