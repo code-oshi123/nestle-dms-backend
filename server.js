@@ -12,6 +12,7 @@ const { Pool } = require('pg');
  *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "routeDate"   DATE;
  *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "depart"      VARCHAR(10);
  *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "routeNotes"  TEXT;
+ *  ALTER TABLE "Routes" ADD COLUMN IF NOT EXISTS "warehouse"   VARCHAR(50);
  *
  *  -- Delivery status update tracking (run once):
  *  ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMPTZ;
@@ -776,7 +777,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
 
 // Publish a full multi-stop route plan
 app.post('/api/routes/publish', auth, async (req, res) => {
-  const { driverId, driverName, vehicleId, routeDate, depart, routeNotes, stops, distKm, durMins, cities } = req.body;
+  const { driverId, driverName, vehicleId, routeDate, depart, routeNotes, warehouse, stops, distKm, durMins, cities } = req.body;
 
   if (!driverId || !driverName || !vehicleId || !Array.isArray(stops) || !stops.length) {
     return res.status(400).json({ error: 'driverId, driverName, vehicleId, and stops[] are required' });
@@ -824,9 +825,9 @@ app.post('/api/routes/publish', auth, async (req, res) => {
     let routeId;
     try {
       const rr = await pool.query(
-        `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","routeDate","depart","routeNotes","createdAt")
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) RETURNING id`,
-        [driverId, driverName, vehicleId, stops.length, distKm, durMins, citiesJson, stopsData, routeDate||null, depart||null, routeNotes||null]
+        `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","routeDate","depart","routeNotes","warehouse","createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()) RETURNING id`,
+        [driverId, driverName, vehicleId, stops.length, distKm, durMins, citiesJson, stopsData, routeDate||null, depart||null, routeNotes||null, warehouse||null]
       );
       routeId = rr.rows[0].id;
     } catch {
@@ -879,10 +880,11 @@ app.post('/api/routes/publish', auth, async (req, res) => {
     const dateLine    = routeDate ? `Date: ${routeDate}` : '';
     const departLine  = depart    ? `Depot departure: ${depart}` : '';
 
+    const warehouseLine = warehouse ? `Departing warehouse: ${warehouse}` : '';
     await notify(
       parseInt(driverId),
       `🗺️ Route Plan Published — ${stops.length} Stops`,
-      `Your route has been planned and published.\n\n${dateLine}${dateLine&&departLine?'\n':''}${departLine}\nVehicle: ${vehicleId}\n${summaryLine}\n\nStop Sequence:\n${stopLines}${routeNotes ? '\n\nRoute Notes: ' + routeNotes : ''}\n\nCheck "My Route Briefing" for the full plan.`,
+      `Your route has been planned and published.\n\n${dateLine}${dateLine&&departLine?'\n':''}${departLine}${warehouseLine?'\n'+warehouseLine:''}\nVehicle: ${vehicleId}\n${summaryLine}\n\nStop Sequence:\n${stopLines}${routeNotes ? '\n\nRoute Notes: ' + routeNotes : ''}\n\nCheck "My Route Briefing" for the full plan.`,
       'info',
       String(routeId)
     );
@@ -931,7 +933,7 @@ app.get('/api/routes', auth, async (req, res) => {
       try {
         r = await pool.query(
           `SELECT rt.id, rt."driverId", rt."driverName", rt."vehicleId", rt.stops, rt."distKm", rt."durMins",
-                  rt.cities, rt."stops_data", rt."routeDate", rt.depart, rt."routeNotes", rt."createdAt",
+                  rt.cities, rt."stops_data", rt."routeDate", rt.depart, rt."routeNotes", rt.warehouse, rt."createdAt",
                   d.status AS "deliveryStatus", d.id AS "deliveryId", d.eta
            FROM "Routes" rt
            LEFT JOIN "Deliveries" d ON d.id = (
@@ -958,7 +960,7 @@ app.get('/api/routes', auth, async (req, res) => {
       try {
         r = await pool.query(
           `SELECT rt.id, rt."driverId", rt."driverName", rt."vehicleId", rt.stops, rt."distKm", rt."durMins",
-                  rt.cities, rt."stops_data", rt."routeDate", rt.depart, rt."routeNotes", rt."createdAt",
+                  rt.cities, rt."stops_data", rt."routeDate", rt.depart, rt."routeNotes", rt.warehouse, rt."createdAt",
                   d.status AS "deliveryStatus", d.id AS "deliveryId", d.eta
            FROM "Routes" rt
            LEFT JOIN "Deliveries" d ON d.id = (
@@ -991,7 +993,7 @@ app.get('/api/routes/my', auth, async (req, res) => {
     try {
       const r = await pool.query(
         `SELECT id,"driverId","driverName","vehicleId",stops,"distKm","durMins",cities,
-                "stops_data","routeDate","depart","routeNotes","createdAt"
+                "stops_data","routeDate","depart","routeNotes",warehouse,"createdAt"
          FROM "Routes"
          WHERE "driverId" = $1
             OR "driverId" = (
