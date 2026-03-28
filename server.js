@@ -152,7 +152,7 @@ app.get('/api/drivers', auth, async (req, res) => {
              CASE WHEN EXISTS (
                SELECT 1 FROM "Deliveries" del
                WHERE del."driverId" = d.id
-                 AND del.status = 'in-transit'
+                 AND del.status IN ('assigned','warehouse_ready','loaded','in-transit')
              ) THEN true ELSE false END AS busy
       FROM "Drivers" d
       LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
@@ -470,15 +470,16 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
 
-    // Block: driver is currently in-transit on another delivery (only in-transit blocks)
+    // Block: driver has any incomplete delivery (assigned/warehouse_ready/loaded/in-transit)
     const driverBusy = await pool.query(
       `SELECT id FROM "Deliveries"
-       WHERE "driverId"=$1 AND id != $2 AND status = 'in-transit' LIMIT 1`,
+       WHERE "driverId"=$1 AND id != $2
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
       [driverId, req.params.id]
     );
     if (driverBusy.rows.length) {
       return res.status(409).json({
-        error: `Driver ${driverName} is currently in transit on delivery #${driverBusy.rows[0].id}. They must complete that delivery before being assigned a new one.`
+        error: `Driver ${driverName} has not completed delivery #${driverBusy.rows[0].id}. All deliveries must be completed before assigning a new one.`
       });
     }
 
@@ -751,14 +752,15 @@ app.post('/api/routes/publish', auth, async (req, res) => {
   }
 
   try {
-    // Block: driver currently in-transit on another delivery
+    // Block: driver has any incomplete delivery
     const driverBusyPub = await pool.query(
-      `SELECT id FROM "Deliveries" WHERE "driverId"=$1 AND status = 'in-transit' LIMIT 1`,
+      `SELECT id FROM "Deliveries"
+       WHERE "driverId"=$1 AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
       [driverId]
     );
     if (driverBusyPub.rows.length) {
       return res.status(409).json({
-        error: `Driver ${driverName} is currently in transit on delivery #${driverBusyPub.rows[0].id}. Complete that delivery before publishing a new route.`
+        error: `Driver ${driverName} has not completed delivery #${driverBusyPub.rows[0].id}. All deliveries must be completed before publishing a new route.`
       });
     }
 
