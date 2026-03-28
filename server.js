@@ -239,9 +239,14 @@ app.get('/api/orders', auth, async (req, res) => {
     let r;
     if (role === 'retailer') {
       r = await pool.query(
-        `SELECT id, city, items, kg, priority AS prio, status, "rejectReason",
-         TO_CHAR("createdAt",'DD Mon HH24:MI') AS created
-         FROM "Orders" WHERE "retailerId"=$1 ORDER BY "createdAt" DESC`,
+        `SELECT o.id, o.city, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason",
+         TO_CHAR(o."createdAt",'DD Mon HH24:MI') AS created,
+         d.id AS "deliveryId", d.status AS "deliveryStatus",
+         d."receiptConfirmed", TO_CHAR(d."receiptAt", 'DD Mon YYYY HH24:MI') AS "receiptAt",
+         d."driverName", d."vehicleId"
+         FROM "Orders" o
+         LEFT JOIN "Deliveries" d ON d."orderId" = o.id
+         WHERE o."retailerId"=$1 ORDER BY o."createdAt" DESC`,
         [userId]
       );
     } else {
@@ -411,7 +416,8 @@ app.get('/api/deliveries', auth, async (req, res) => {
       );
     } else {
       r = await pool.query(
-        `SELECT d.*, o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio
+        `SELECT d.*, o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio,
+         TO_CHAR(d."receiptAt", 'DD Mon YYYY HH24:MI') AS "receiptAt"
          FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
          ORDER BY d."createdAt" DESC`
       );
@@ -1155,6 +1161,95 @@ app.delete('/api/users/:id', auth, adminOnly, async (req, res) => {
     const r = await pool.query('DELETE FROM "Users" WHERE id=$1 RETURNING id,name', [req.params.id]);
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ ok: true, deleted: r.rows[0].name });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ══════════════════════════════════════════════
+// DELIVERY RECEIPT CONFIRMATION (retailer)
+// ══════════════════════════════════════════════
+app.put('/api/deliveries/:id/confirm-receipt', auth, async (req, res) => {
+  const { note } = req.body;
+  try {
+    // Only retailer who owns the order can confirm
+    const del = await pool.query(
+      `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city, o.items
+       FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
+      [req.params.id]
+    );
+    if (!del.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    const d = del.rows[0];
+
+    if (d.retailerId !== req.user.id) {
+      return res.status(403).json({ error: 'You can only confirm your own deliveries' });
+    }
+    if (d.status !== 'delivered') {
+      return res.status(400).json({ error: 'Can only confirm receipt of a delivered order' });
+    }
+
+    // Try with receiptConfirmed columns — add them if missing
+    try {
+      await pool.query(
+        `UPDATE "Deliveries"
+         SET "receiptConfirmed"=true, "receiptNote"=$1, "receiptAt"=NOW()
+         WHERE id=$2`,
+        [note||null, req.params.id]
+      );
+    } catch {
+      // Columns don't exist yet — add them then retry
+      await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "receiptConfirmed" BOOLEAN DEFAULT false`);
+      await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "receiptNote" TEXT`);
+      await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "receiptAt" TIMESTAMPTZ`);
+      await pool.query(
+        `UPDATE "Deliveries"
+         SET "receiptConfirmed"=true, "receiptNote"=$1, "receiptAt"=NOW()
+         WHERE id=$2`,
+        [note||null, req.params.id]
+      );
+    }
+
+    // Notify driver
+    const rawDriverId = d.driverId ? Number(d.driverId) : null;
+    if (rawDriverId) {
+      const driverUid = await driverUserId(rawDriverId);
+      await notify(
+        driverUid || rawDriverId,
+        '✅ Receipt Confirmed by Retailer',
+        `${d.retailer} has confirmed receipt of delivery ${req.params.id} to ${d.city} (${d.items} items).${note ? ' Note: ' + note : ''}`,
+        'success', req.params.id
+      );
+    }
+
+    // Notify order team + route planner
+    const staff = await pool.query(
+      `SELECT id FROM "Users" WHERE role IN ('order_team','route_planner')`
+    );
+    for (const u of staff.rows) {
+      await notify(
+        u.id,
+        '📋 Delivery Receipt Confirmed',
+        `${d.retailer} confirmed receipt of delivery ${req.params.id} to ${d.city}.${note ? ' Retailer note: ' + note : ''} Delivery is fully complete.`,
+        'success', req.params.id
+      );
+    }
+
+    res.json({ ok: true, receiptAt: new Date().toISOString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/deliveries/:id/receipt', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT d.id, d.status, d."receiptConfirmed", d."receiptNote", d."receiptAt",
+              d."driverName", d."vehicleId", d.eta,
+              o."retailerName" AS retailer, o.city, o.items, o.kg,
+              TO_CHAR(d."receiptAt", 'DD Mon YYYY HH24:MI') AS "receiptAtFormatted"
+       FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+       WHERE d.id=$1`,
+      [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
