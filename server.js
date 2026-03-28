@@ -179,7 +179,8 @@ app.get('/api/vehicles', auth, async (req, res) => {
                JOIN "Orders" o ON d."orderId" = o.id
                WHERE d."vehicleId" = v.id AND d.status = 'in-transit'), 0) AS "loadedKg",
              CASE WHEN EXISTS (SELECT 1 FROM "Deliveries" d2
-               WHERE d2."vehicleId" = v.id AND d2.status = 'in-transit'
+               WHERE d2."vehicleId" = v.id
+                 AND d2.status IN ('assigned','warehouse_ready','loaded','in-transit')
              ) THEN true ELSE false END AS busy
       FROM "Vehicles" v ORDER BY v.id
     `);
@@ -516,15 +517,16 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       });
     }
 
-    // Block: vehicle currently in-transit for a different driver
+    // Block: vehicle has any incomplete delivery
     const vehicleBusy = await pool.query(
       `SELECT "driverName" FROM "Deliveries"
-       WHERE "vehicleId"=$1 AND id != $2 AND status = 'in-transit' LIMIT 1`,
+       WHERE "vehicleId"=$1 AND id != $2
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
       [vehicleId, req.params.id]
     );
     if (vehicleBusy.rows.length) {
       return res.status(409).json({
-        error: `Vehicle ${vehicleId} is currently in transit with driver ${vehicleBusy.rows[0].driverName}. It cannot be reassigned until that delivery is completed.`
+        error: `Vehicle ${vehicleId} has an incomplete delivery with driver ${vehicleBusy.rows[0].driverName}. It cannot be assigned until that delivery is completed.`
       });
     }
 
@@ -811,15 +813,16 @@ app.post('/api/routes/publish', auth, async (req, res) => {
       });
     }
 
-    // Block: vehicle in-transit for a different driver
+    // Block: vehicle has any incomplete delivery for a different driver
     const vehicleBusyPub = await pool.query(
       `SELECT "driverName" FROM "Deliveries"
-       WHERE "vehicleId"=$1 AND "driverId" != $2 AND status = 'in-transit' LIMIT 1`,
+       WHERE "vehicleId"=$1 AND "driverId" != $2
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
       [vehicleId, driverId]
     );
     if (vehicleBusyPub.rows.length) {
       return res.status(409).json({
-        error: `Vehicle ${vehicleId} is currently in transit with driver ${vehicleBusyPub.rows[0].driverName}. Choose a different vehicle.`
+        error: `Vehicle ${vehicleId} has an incomplete delivery with driver ${vehicleBusyPub.rows[0].driverName}. Choose a different vehicle.`
       });
     }
 
