@@ -396,10 +396,17 @@ app.get('/api/deliveries', auth, async (req, res) => {
   try {
     let r;
     if (role === 'distributor') {
+      // Resolve both Users.id and linked Drivers.id so deliveries are found regardless of which ID was stored
       r = await pool.query(
         `SELECT d.*, o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio
          FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
-         WHERE d."driverId"=$1 ORDER BY d."createdAt" DESC`,
+         WHERE d."driverId" = $1
+            OR d."driverId" = (
+              SELECT dr.id FROM "Drivers" dr
+              JOIN "Users" u ON lower(u.name) = lower(dr.name)
+              WHERE u.id = $1 AND u.role = 'distributor' LIMIT 1
+            )
+         ORDER BY d."createdAt" DESC`,
         [userId]
       );
     } else {
@@ -979,7 +986,14 @@ app.get('/api/routes/my', auth, async (req, res) => {
       const r = await pool.query(
         `SELECT id,"driverId","driverName","vehicleId",stops,"distKm","durMins",cities,
                 "stops_data","routeDate","depart","routeNotes","createdAt"
-         FROM "Routes" WHERE "driverId"=$1 ORDER BY "createdAt" DESC`,
+         FROM "Routes"
+         WHERE "driverId" = $1
+            OR "driverId" = (
+              SELECT dr.id FROM "Drivers" dr
+              JOIN "Users" u ON lower(u.name) = lower(dr.name)
+              WHERE u.id = $1 AND u.role = 'distributor' LIMIT 1
+            )
+         ORDER BY "createdAt" DESC`,
         [driverId]
       );
       routes = r.rows;
@@ -988,7 +1002,14 @@ app.get('/api/routes/my', auth, async (req, res) => {
       try {
         const r = await pool.query(
           `SELECT id,"driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"createdAt"
-           FROM "Routes" WHERE "driverId"=$1 ORDER BY "createdAt" DESC`,
+           FROM "Routes"
+           WHERE "driverId" = $1
+              OR "driverId" = (
+                SELECT dr.id FROM "Drivers" dr
+                JOIN "Users" u ON lower(u.name) = lower(dr.name)
+                WHERE u.id = $1 AND u.role = 'distributor' LIMIT 1
+              )
+           ORDER BY "createdAt" DESC`,
           [driverId]
         );
         routes = r.rows;
@@ -1005,7 +1026,14 @@ app.get('/api/routes/my', auth, async (req, res) => {
               o."retailerName" AS retailer, o.city, o.items, o.priority
        FROM "Deliveries" d
        JOIN "Orders" o ON d."orderId"=o.id
-       WHERE d."driverId"=$1
+       WHERE (
+         d."driverId" = $1
+         OR d."driverId" = (
+           SELECT dr.id FROM "Drivers" dr
+           JOIN "Users" u ON lower(u.name) = lower(dr.name)
+           WHERE u.id = $1 AND u.role = 'distributor' LIMIT 1
+         )
+       )
        ORDER BY d."createdAt" ASC`,
       [driverId]
     );
