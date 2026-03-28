@@ -151,8 +151,11 @@ app.get('/api/drivers', auth, async (req, res) => {
       SELECT d.id, d.name, d.phone, u.id AS "userId",
              CASE WHEN EXISTS (
                SELECT 1 FROM "Deliveries" del
-               WHERE (del."driverId" = d.id OR del."driverId" = u.id)
-                 AND del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+               WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                 AND (
+                   del."driverId" = d.id
+                   OR (u.id IS NOT NULL AND del."driverId" = u.id)
+                 )
              ) THEN true ELSE false END AS busy
       FROM "Drivers" d
       LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
@@ -470,25 +473,23 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
 
-    // Block: driver has any incomplete delivery — check both Drivers.id and linked Users.id
+    // Block: driver has any incomplete delivery — resolve both Drivers.id and Users.id
+    // First get the linked Users.id for this Drivers.id (may be same or different)
+    const driverLinked = await pool.query(
+      `SELECT COALESCE(u.id, $1::int) AS uid
+       FROM "Drivers" dr
+       LEFT JOIN "Users" u ON lower(u.name) = lower(dr.name) AND u.role = 'distributor'
+       WHERE dr.id = $1 LIMIT 1`,
+      [driverId]
+    );
+    const linkedUserId = driverLinked.rows[0]?.uid || driverId;
     const driverBusy = await pool.query(
-      `SELECT d.id FROM "Deliveries" d
-       WHERE d.id != $2
-         AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')
-         AND (
-           d."driverId" = $1
-           OR d."driverId" = (
-             SELECT u.id FROM "Users" u
-             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
-             WHERE dr.id = $1 AND u.role = 'distributor' LIMIT 1
-           )
-           OR $1 = (
-             SELECT u.id FROM "Users" u
-             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
-             WHERE dr.id = d."driverId" AND u.role = 'distributor' LIMIT 1
-           )
-         ) LIMIT 1`,
-      [driverId, req.params.id]
+      `SELECT id FROM "Deliveries"
+       WHERE id != $3
+         AND status IN ('assigned','warehouse_ready','loaded','in-transit')
+         AND "driverId" IN ($1, $2)
+       LIMIT 1`,
+      [driverId, linkedUserId, req.params.id]
     );
     if (driverBusy.rows.length) {
       return res.status(409).json({
@@ -765,24 +766,21 @@ app.post('/api/routes/publish', auth, async (req, res) => {
   }
 
   try {
-    // Block: driver has any incomplete delivery — check both Drivers.id and linked Users.id
-    const driverBusyPub = await pool.query(
-      `SELECT d.id FROM "Deliveries" d
-       WHERE d.status IN ('assigned','warehouse_ready','loaded','in-transit')
-         AND (
-           d."driverId" = $1
-           OR d."driverId" = (
-             SELECT u.id FROM "Users" u
-             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
-             WHERE dr.id = $1 AND u.role = 'distributor' LIMIT 1
-           )
-           OR $1 = (
-             SELECT u.id FROM "Users" u
-             JOIN "Drivers" dr ON lower(u.name) = lower(dr.name)
-             WHERE dr.id = d."driverId" AND u.role = 'distributor' LIMIT 1
-           )
-         ) LIMIT 1`,
+    // Block: driver has any incomplete delivery — resolve both Drivers.id and Users.id
+    const driverLinkedPub = await pool.query(
+      `SELECT COALESCE(u.id, $1::int) AS uid
+       FROM "Drivers" dr
+       LEFT JOIN "Users" u ON lower(u.name) = lower(dr.name) AND u.role = 'distributor'
+       WHERE dr.id = $1 LIMIT 1`,
       [driverId]
+    );
+    const linkedUserIdPub = driverLinkedPub.rows[0]?.uid || driverId;
+    const driverBusyPub = await pool.query(
+      `SELECT id FROM "Deliveries"
+       WHERE status IN ('assigned','warehouse_ready','loaded','in-transit')
+         AND "driverId" IN ($1, $2)
+       LIMIT 1`,
+      [driverId, linkedUserIdPub]
     );
     if (driverBusyPub.rows.length) {
       return res.status(409).json({
