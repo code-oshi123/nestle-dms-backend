@@ -627,10 +627,12 @@ app.put('/api/deliveries/:id/warehouse-ready', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'warehouse_ready\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdWR = d && d.driverId ? Number(d.driverId) : null;
-    if (driverIdWR) {
+    const rawDriverId = d && d.driverId ? Number(d.driverId) : null;
+    if (rawDriverId) {
+      const notifyUid = await driverUserId(rawDriverId);
+      const targetUid = notifyUid || rawDriverId;
       await notify(
-        driverIdWR,
+        targetUid,
         'Cargo Ready for Pickup 📦',
         `Your cargo for delivery ${req.params.id} is packed and ready at the warehouse. Please proceed to collect your vehicle.`,
         'success',
@@ -648,10 +650,12 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
     await pool.query('UPDATE "Deliveries" SET status=\'loaded\' WHERE id=$1', [req.params.id]);
     const del = await pool.query('SELECT * FROM "Deliveries" WHERE id=$1', [req.params.id]);
     const d = del.rows[0];
-    const driverIdL = d && d.driverId ? Number(d.driverId) : null;
-    if (driverIdL) {
+    const rawDriverIdL = d && d.driverId ? Number(d.driverId) : null;
+    if (rawDriverIdL) {
+      const notifyUidL = await driverUserId(rawDriverIdL);
+      const targetUidL = notifyUidL || rawDriverIdL;
       await notify(
-        driverIdL,
+        targetUidL,
         'Vehicle Loaded ✅ — Ready to Depart',
         `Your vehicle for delivery ${req.params.id} has been fully loaded. You are cleared to depart. Check "My Routes" for your stop sequence.`,
         'success',
