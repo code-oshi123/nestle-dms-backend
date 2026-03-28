@@ -54,7 +54,7 @@ app.post('/api/login', async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
     const r = await pool.query(
-      'SELECT * FROM "Users" WHERE lower("Email")=lower($1) OR lower(name)=lower($1)',
+      'SELECT * FROM "Users" WHERE lower(\"Email\")=lower($1) OR lower(name)=lower($1)',
       [email.trim()]
     );
     if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
@@ -148,12 +148,11 @@ async function notify(userId, title, message, type='info', refId=null) {
 app.get('/api/drivers', auth, async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT d.id, d.name, d.phone,
-             u.id AS "userId",
+      SELECT d.id, d.name, d.phone, u.id AS "userId",
              CASE WHEN EXISTS (
                SELECT 1 FROM "Deliveries" del
                WHERE del."driverId" = d.id
-                 AND del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                 AND del.status = 'in-transit'
              ) THEN true ELSE false END AS busy
       FROM "Drivers" d
       LEFT JOIN "Users" u ON lower(u.name) = lower(d.name) AND u.role = 'distributor'
@@ -167,16 +166,11 @@ app.get('/api/vehicles', auth, async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT v.*,
-             COALESCE((
-               SELECT SUM(o.kg) FROM "Deliveries" d
+             COALESCE((SELECT SUM(o.kg) FROM "Deliveries" d
                JOIN "Orders" o ON d."orderId" = o.id
-               WHERE d."vehicleId" = v.id
-                 AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')
-             ), 0) AS "loadedKg",
-             CASE WHEN EXISTS (
-               SELECT 1 FROM "Deliveries" d2
-               WHERE d2."vehicleId" = v.id
-                 AND d2.status IN ('assigned','warehouse_ready','loaded','in-transit')
+               WHERE d."vehicleId" = v.id AND d.status = 'in-transit'), 0) AS "loadedKg",
+             CASE WHEN EXISTS (SELECT 1 FROM "Deliveries" d2
+               WHERE d2."vehicleId" = v.id AND d2.status = 'in-transit'
              ) THEN true ELSE false END AS busy
       FROM "Vehicles" v ORDER BY v.id
     `);
@@ -468,38 +462,35 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
   }
 
   try {
-    // Block if locked
+    // Block if delivery itself is locked
     const check = await pool.query('SELECT status, "driverId" AS "oldDriverId" FROM "Deliveries" WHERE id=$1', [req.params.id]);
     if (!check.rows.length) return res.status(404).json({ error: 'Delivery not found' });
     const current = check.rows[0];
-    const lockedStatuses = ['in-transit', 'delivered', 'failed'];
-    if (lockedStatuses.includes(current.status)) {
+    if (['in-transit', 'delivered', 'failed'].includes(current.status)) {
       return res.status(409).json({ error: `Cannot reassign — delivery is already "${current.status}". Route is locked once in transit or completed.` });
     }
 
-    // Block: driver already has an active incomplete delivery
+    // Block: driver is currently in-transit on another delivery (only in-transit blocks)
     const driverBusy = await pool.query(
       `SELECT id FROM "Deliveries"
-       WHERE "driverId"=$1 AND id != $2
-         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
+       WHERE "driverId"=$1 AND id != $2 AND status = 'in-transit' LIMIT 1`,
       [driverId, req.params.id]
     );
     if (driverBusy.rows.length) {
       return res.status(409).json({
-        error: `Driver ${driverName} has not completed delivery #${driverBusy.rows[0].id}. Finish or reassign that delivery before assigning a new one.`
+        error: `Driver ${driverName} is currently in transit on delivery #${driverBusy.rows[0].id}. They must complete that delivery before being assigned a new one.`
       });
     }
 
-    // Block: vehicle already active on a different delivery
+    // Block: vehicle currently in-transit for a different driver
     const vehicleBusy = await pool.query(
       `SELECT "driverName" FROM "Deliveries"
-       WHERE "vehicleId"=$1 AND id != $2
-         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
+       WHERE "vehicleId"=$1 AND id != $2 AND status = 'in-transit' LIMIT 1`,
       [vehicleId, req.params.id]
     );
     if (vehicleBusy.rows.length) {
       return res.status(409).json({
-        error: `Vehicle ${vehicleId} is currently in use by driver ${vehicleBusy.rows[0].driverName}. It cannot be assigned until their delivery is completed.`
+        error: `Vehicle ${vehicleId} is currently in transit with driver ${vehicleBusy.rows[0].driverName}. It cannot be reassigned until that delivery is completed.`
       });
     }
 
@@ -514,29 +505,28 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
       const cap = parseFloat(capRow.rows[0].cap) || 0;
       if (cap > 0) {
         const loadedRow = await pool.query(
-          `SELECT COALESCE(SUM(o.kg),0) AS total
-           FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
-           WHERE d."vehicleId"=$1 AND d.id != $2
-             AND d.status IN ('assigned','warehouse_ready','loaded','in-transit')`,
+          `SELECT COALESCE(SUM(o.kg),0) AS total FROM "Deliveries" d
+           JOIN "Orders" o ON d."orderId"=o.id
+           WHERE d."vehicleId"=$1 AND d.id != $2 AND d.status = 'in-transit'`,
           [vehicleId, req.params.id]
         );
         const usedKg = parseFloat(loadedRow.rows[0].total) || 0;
         if (usedKg + thisKg > cap) {
           return res.status(409).json({
-            error: `Vehicle ${vehicleId} overloaded. Capacity: ${cap}kg, Already: ${usedKg}kg, This delivery: ${thisKg}kg. Choose a different vehicle.`
+            error: `Vehicle ${vehicleId} overloaded. Capacity: ${cap}kg, In transit: ${usedKg}kg, This delivery: ${thisKg}kg.`
           });
         }
       }
     }
 
-    // UPDATE DB first, then notify old driver (commit before notifying)
+    // UPDATE DB first, then notify old driver
     const oldDriverId = parseInt(current.oldDriverId);
     await pool.query(
       'UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status=\'assigned\',eta=$4 WHERE id=$5',
       [driverId, driverName, vehicleId, eta, req.params.id]
     );
 
-    // Notify old driver AFTER DB updated
+    // Notify removed driver AFTER DB is updated
     if (oldDriverId && oldDriverId !== parseInt(driverId)) {
       const oldUid = await driverUserId(oldDriverId);
       if (oldUid) {
@@ -761,28 +751,26 @@ app.post('/api/routes/publish', auth, async (req, res) => {
   }
 
   try {
-    // Block: driver already has an active incomplete delivery
+    // Block: driver currently in-transit on another delivery
     const driverBusyPub = await pool.query(
-      `SELECT id FROM "Deliveries"
-       WHERE "driverId"=$1 AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
+      `SELECT id FROM "Deliveries" WHERE "driverId"=$1 AND status = 'in-transit' LIMIT 1`,
       [driverId]
     );
     if (driverBusyPub.rows.length) {
       return res.status(409).json({
-        error: `Driver ${driverName} has not completed delivery #${driverBusyPub.rows[0].id}. Finish or reassign that delivery before publishing a new route.`
+        error: `Driver ${driverName} is currently in transit on delivery #${driverBusyPub.rows[0].id}. Complete that delivery before publishing a new route.`
       });
     }
 
-    // Block: vehicle already active on another delivery for a different driver
+    // Block: vehicle in-transit for a different driver
     const vehicleBusyPub = await pool.query(
       `SELECT "driverName" FROM "Deliveries"
-       WHERE "vehicleId"=$1 AND "driverId" != $2
-         AND status IN ('assigned','warehouse_ready','loaded','in-transit') LIMIT 1`,
+       WHERE "vehicleId"=$1 AND "driverId" != $2 AND status = 'in-transit' LIMIT 1`,
       [vehicleId, driverId]
     );
     if (vehicleBusyPub.rows.length) {
       return res.status(409).json({
-        error: `Vehicle ${vehicleId} is currently in use by driver ${vehicleBusyPub.rows[0].driverName}. Choose a different vehicle.`
+        error: `Vehicle ${vehicleId} is currently in transit with driver ${vehicleBusyPub.rows[0].driverName}. Choose a different vehicle.`
       });
     }
 
@@ -1112,21 +1100,16 @@ app.delete('/api/users/:id', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/deliveries/:id/history
 app.get('/api/deliveries/:id/history', auth, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT status, note, "updatedBy",
        TO_CHAR("createdAt", 'HH24:MI DD Mon YYYY') AS time
-       FROM "StatusHistory"
-       WHERE "deliveryId"=$1 ORDER BY "createdAt" ASC`,
+       FROM "StatusHistory" WHERE "deliveryId"=$1 ORDER BY "createdAt" ASC`,
       [req.params.id]
     );
     res.json(r.rows);
-  } catch {
-    // StatusHistory table may not exist yet
-    res.json([]);
-  }
+  } catch { res.json([]); }
 });
 
 // ══════════════════════════════════════════════
@@ -1153,15 +1136,14 @@ app.get('/api/retailers', auth, orderTeamOnly, async (req, res) => {
 
 app.post('/api/retailers', auth, orderTeamOnly, async (req, res) => {
   const { name, email, password, avatar } = req.body;
-  if (!name || !name.trim())   return res.status(400).json({ error: 'Name is required' });
-  if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required' });
-  if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  if (!name||!name.trim())   return res.status(400).json({ error: 'Name is required' });
+  if (!email||!email.trim()) return res.status(400).json({ error: 'Email is required' });
+  if (!password||password.length<4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
   try {
     const exists = await pool.query('SELECT id FROM "Users" WHERE lower("Email")=lower($1)', [email]);
     if (exists.rows.length) return res.status(409).json({ error: `Email ${email} is already registered` });
     const hash = await bcrypt.hash(password, 10);
-    const initials = (avatar && avatar.trim())
-      ? avatar.trim().toUpperCase().slice(0,2)
+    const initials = (avatar&&avatar.trim()) ? avatar.trim().toUpperCase().slice(0,2)
       : name.trim().split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
     const r = await pool.query(
       `INSERT INTO "Users"(name,"Email","PasswordHash",role,avatar,"createdAt")
@@ -1184,7 +1166,7 @@ app.delete('/api/retailers/:id', auth, orderTeamOnly, async (req, res) => {
 
 app.put('/api/retailers/:id/reset-password', auth, orderTeamOnly, async (req, res) => {
   const { password } = req.body;
-  if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  if (!password||password.length<4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
   try {
     const hash = await bcrypt.hash(password, 10);
     const r = await pool.query(
@@ -1195,9 +1177,6 @@ app.put('/api/retailers/:id/reset-password', auth, orderTeamOnly, async (req, re
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// START
-// ══════════════════════════════════════════════
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Nestlé DMS API running on port ${PORT}`));
