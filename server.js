@@ -29,6 +29,11 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Set Sri Lanka timezone for all DB sessions
+pool.on('connect', client => {
+  client.query("SET timezone = 'Asia/Colombo'");
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || 'nestle-dms-secret-change-in-prod';
 
 // ── Middleware: verify JWT token ──────────────
@@ -79,7 +84,7 @@ app.get('/api/notifications', auth, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT id, title, message, type, "isRead", "refId",
-       TO_CHAR("createdAt", 'HH24:MI DD Mon') AS time
+       TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI DD Mon') AS time
        FROM "Notifications" WHERE "userId"=$1
        ORDER BY "createdAt" DESC LIMIT 50`,
       [userId]
@@ -241,9 +246,9 @@ app.get('/api/orders', auth, async (req, res) => {
     if (role === 'retailer') {
       r = await pool.query(
         `SELECT o.id, o.city, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason",
-         TO_CHAR(o."createdAt",'DD Mon HH24:MI') AS created,
+         TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
          d.id AS "deliveryId", d.status AS "deliveryStatus",
-         d."receiptConfirmed", TO_CHAR(d."receiptAt", 'DD Mon YYYY HH24:MI') AS "receiptAt",
+         d."receiptConfirmed", TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
          d."driverName", d."vehicleId"
          FROM "Orders" o
          LEFT JOIN "Deliveries" d ON d."orderId" = o.id
@@ -254,7 +259,7 @@ app.get('/api/orders', auth, async (req, res) => {
       r = await pool.query(
         `SELECT id, "retailerName" AS retailer, city, items, kg,
          priority AS prio, status, "confirmedBy", "rejectReason",
-         TO_CHAR("createdAt",'DD Mon HH24:MI') AS created
+         TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created
          FROM "Orders" ORDER BY "createdAt" DESC`
       );
     }
@@ -418,7 +423,7 @@ app.get('/api/deliveries', auth, async (req, res) => {
     } else {
       r = await pool.query(
         `SELECT d.*, o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio,
-         TO_CHAR(d."receiptAt", 'DD Mon YYYY HH24:MI') AS "receiptAt"
+         TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt"
          FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
          ORDER BY d."createdAt" DESC`
       );
@@ -475,7 +480,7 @@ app.put('/api/deliveries/:id/assign', auth, async (req, res) => {
     eta = etaOverride;
   } else {
     const etaDate = new Date(Date.now() + 2*60*60*1000);
-    eta = etaDate.toLocaleTimeString('en-LK', { hour:'2-digit', minute:'2-digit' });
+    eta = etaDate.toLocaleString('en-LK', { timeZone:'Asia/Colombo', hour:'2-digit', minute:'2-digit', hour12:false });
   }
 
   try {
@@ -1079,7 +1084,7 @@ app.get('/api/routes/my', auth, async (req, res) => {
       routeDate:    null,
       depart:       null,
       routeNotes:   null,
-      createdAt:    new Date(),
+      createdAt:    new Date().toLocaleString('en-LK', { timeZone:'Asia/Colombo' }),
       _synthetic:   true   // flag so frontend knows this was auto-generated
     };
 
@@ -1117,7 +1122,7 @@ app.get('/api/users', auth, adminOnly, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT id, name, "Email", role, avatar,
-       TO_CHAR("createdAt", 'DD Mon YYYY') AS "createdAt"
+       TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY') AS "createdAt"
        FROM "Users" ORDER BY role, name`
     );
     res.json(r.rows);
@@ -1235,7 +1240,7 @@ app.put('/api/deliveries/:id/confirm-receipt', auth, async (req, res) => {
       );
     }
 
-    res.json({ ok: true, receiptAt: new Date().toISOString() });
+    res.json({ ok: true, receiptAt: new Date().toLocaleString('en-LK', { timeZone:'Asia/Colombo' }) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1245,7 +1250,7 @@ app.get('/api/deliveries/:id/receipt', auth, async (req, res) => {
       `SELECT d.id, d.status, d."receiptConfirmed", d."receiptNote", d."receiptAt",
               d."driverName", d."vehicleId", d.eta,
               o."retailerName" AS retailer, o.city, o.items, o.kg,
-              TO_CHAR(d."receiptAt", 'DD Mon YYYY HH24:MI') AS "receiptAtFormatted"
+              TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAtFormatted"
        FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
        WHERE d.id=$1`,
       [req.params.id]
@@ -1259,7 +1264,7 @@ app.get('/api/deliveries/:id/history', auth, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT status, note, "updatedBy",
-       TO_CHAR("createdAt", 'HH24:MI DD Mon YYYY') AS time
+       TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI DD Mon YYYY') AS time
        FROM "StatusHistory" WHERE "deliveryId"=$1 ORDER BY "createdAt" ASC`,
       [req.params.id]
     );
@@ -1282,7 +1287,7 @@ app.get('/api/retailers', auth, orderTeamOnly, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT id, name, "Email", avatar,
-       TO_CHAR("createdAt", 'DD Mon YYYY') AS "createdAt"
+       TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY') AS "createdAt"
        FROM "Users" WHERE role='retailer' ORDER BY name`
     );
     res.json(r.rows);
