@@ -380,19 +380,209 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
         o.id
       );
 
-      // ── FIX: Also notify route_planner & warehouse when confirmed ──
+      // ── AUTO BATCH: accumulate confirmed orders, dispatch route every 10 orders ──
       if (action === 'confirm') {
-        const planners = await pool.query(
-          'SELECT id FROM "Users" WHERE role IN (\'route_planner\', \'warehouse\')'
-        );
-        for (const u of planners.rows) {
-          await notify(
-            u.id,
-            'Order Confirmed — Awaiting Consolidation 📋',
-            `Order ${o.id} from ${o.retailerName} to ${o.city} (${o.items} items, ${o.kg}kg) has been confirmed.`,
-            'info',
-            o.id
+        try {
+          // 1. Create delivery record and mark order as consolidated
+          await pool.query(
+            `INSERT INTO "Deliveries"("orderId",status,"createdAt") VALUES($1,'pending',NOW())`,
+            [o.id]
           );
+          await pool.query(`UPDATE "Orders" SET status='consolidated' WHERE id=$1`, [o.id]);
+
+          // 2. Notify retailer — order queued
+          await notify(
+            o.retailerId,
+            '✅ Order Confirmed — Queued for Dispatch',
+            `Your order ${o.id} to ${o.city} is confirmed and queued. It will be dispatched when the next batch of 10 orders is ready.`,
+            'success', o.id
+          );
+
+          // 3. Count unassigned pending deliveries
+          const pendingRes = await pool.query(`SELECT COUNT(*) FROM "Deliveries" WHERE status='pending'`);
+          const pendingCount = parseInt(pendingRes.rows[0].count);
+
+          // 4. Notify OPT of queue progress
+          const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+          for (const u of optUsers.rows) {
+            const remaining = 10 - pendingCount;
+            await notify(
+              u.id,
+              `📦 Order Queued (${pendingCount}/10)`,
+              pendingCount >= 10
+                ? `${pendingCount} orders ready — auto-route is being created now!`
+                : `Order ${o.id} queued. ${remaining} more order(s) needed to trigger auto-route.`,
+              pendingCount >= 10 ? 'success' : 'info', o.id
+            );
+          }
+
+          // 5. Trigger route creation when batch is full
+          if (pendingCount >= 10) {
+
+            // Fetch all pending deliveries sorted by priority then date
+            const batchRes = await pool.query(
+              `SELECT d.id AS "deliveryId", o."retailerName", o.city, o.items, o.kg,
+                      o.priority, o."retailerId", o.id AS "orderId"
+               FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+               WHERE d.status='pending'
+               ORDER BY CASE o.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+                        d."createdAt" ASC`
+            );
+            const batch = batchRes.rows;
+
+            // Haversine distance helper
+            const hv = (a,b) => {
+              const R=6371, dLat=(b.lat-a.lat)*Math.PI/180, dLng=(b.lng-a.lng)*Math.PI/180;
+              const x=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+              return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+            };
+
+            const CC = {
+              'Colombo':{lat:6.9271,lng:79.8612},'Galle':{lat:6.0535,lng:80.2210},
+              'Kandy':{lat:7.2906,lng:80.6337},'Kurunegala':{lat:7.4875,lng:80.3647},
+              'Matara':{lat:5.9549,lng:80.5550},'Negombo':{lat:7.2096,lng:79.8386},
+              'Ratnapura':{lat:6.6828,lng:80.4004},'Jaffna':{lat:9.6615,lng:80.0255},
+              'Peradeniya':{lat:7.2676,lng:80.5957},'Dehiwala':{lat:6.8519,lng:79.8674},
+              'Nugegoda':{lat:6.8728,lng:79.8880},'Kiribathgoda':{lat:7.0003,lng:80.0170},
+            };
+            const WH = {
+              'Colombo':{lat:6.9271,lng:79.8612},'Galle':{lat:6.0535,lng:80.2210},
+              'Kandy':{lat:7.2906,lng:80.6337},'Kurunegala':{lat:7.4875,lng:80.3647},
+            };
+
+            // Nearest-neighbour pass from Colombo to find first stop
+            const rem = [...batch];
+            let cur = WH['Colombo'];
+            const pass1 = [];
+            while (rem.length) {
+              let bi=0,bd=Infinity;
+              rem.forEach((d,i)=>{ const c=CC[d.city]||CC['Colombo']; const dist=hv(cur,c); if(dist<bd){bd=dist;bi=i;} });
+              const ch=rem.splice(bi,1)[0]; pass1.push(ch); cur=CC[ch.city]||CC['Colombo'];
+            }
+
+            // Find nearest warehouse to first stop
+            const fc=CC[pass1[0].city]||CC['Colombo'];
+            let bestWH='Colombo',bestWHD=Infinity;
+            for(const [wn,wc] of Object.entries(WH)){ const d=hv(fc,wc); if(d<bestWHD){bestWHD=d;bestWH=wn;} }
+
+            // Re-run optimisation from the correct warehouse
+            const rem2=[...batch];
+            let cur2=WH[bestWH];
+            const optimised=[];
+            while(rem2.length){
+              let bi=0,bd=Infinity;
+              rem2.forEach((d,i)=>{ const c=CC[d.city]||CC['Colombo']; const dist=hv(cur2,c); if(dist<bd){bd=dist;bi=i;} });
+              const ch=rem2.splice(bi,1)[0]; optimised.push(ch); cur2=CC[ch.city]||CC['Colombo'];
+            }
+
+            // Find available driver
+            const drvRes = await pool.query(
+              `SELECT d.id, d.name, COALESCE(u.id,d.id) AS "userId"
+               FROM "Drivers" d
+               LEFT JOIN "Users" u ON lower(u.name)=lower(d.name) AND u.role='distributor'
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM "Deliveries" del
+                 WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                   AND (del."driverId"=d.id OR (u.id IS NOT NULL AND del."driverId"=u.id))
+               ) LIMIT 1`
+            );
+
+            const totalKg = optimised.reduce((s,d)=>s+(parseFloat(d.kg)||0),0);
+            const vehRes = await pool.query(
+              `SELECT v.id, v.plate, v.type, v.cap FROM "Vehicles" v
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM "Deliveries" del
+                 WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                   AND del."vehicleId"=v.id
+               )
+               AND (v.cap IS NULL OR v.cap=0 OR v.cap>=$1)
+               ORDER BY v.cap ASC LIMIT 1`,
+              [totalKg]
+            );
+
+            if (drvRes.rows.length && vehRes.rows.length) {
+              const drv=drvRes.rows[0], veh=vehRes.rows[0];
+
+              // Build ETAs — 45 min per stop from now+1hr
+              let dH=new Date().getHours()+1, dM=0;
+              const stopsData = optimised.map((d,i) => {
+                dH+=Math.floor((dM+45)/60); dM=(dM+45)%60;
+                const eta=`${String(dH%24).padStart(2,'0')}:${String(dM).padStart(2,'0')}`;
+                return { deliveryId:d.deliveryId, retailer:d.retailerName, city:d.city, items:d.items, priority:d.priority, eta, stopNote:'' };
+              });
+
+              // Total distance
+              let totDist=0; let prev=WH[bestWH];
+              optimised.forEach(d=>{ const c=CC[d.city]||CC['Colombo']; totDist+=hv(prev,c); prev=c; });
+              const distKm=Math.round(totDist*1.3), durMins=Math.round(distKm*2.5);
+              const cities=optimised.map(d=>d.city);
+
+              // Assign all deliveries
+              for(const stop of stopsData) {
+                await pool.query(
+                  `UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status='assigned',eta=$4 WHERE id=$5`,
+                  [drv.id,drv.name,veh.id,stop.eta,stop.deliveryId]
+                );
+              }
+
+              // Create single route record
+              try {
+                await pool.query(
+                  `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","warehouse","createdAt")
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
+                  [drv.id,drv.name,veh.id,optimised.length,distKm,durMins,
+                   JSON.stringify(cities),JSON.stringify(stopsData),bestWH]
+                );
+              } catch(re){ console.error('[auto-route]',re.message); }
+
+              // Notify driver — full briefing
+              const stopLines=stopsData.map((s,i)=>`  Stop ${i+1}: ${s.city} — ${s.retailer} (${s.items} items) ETA ${s.eta}`).join('\n');
+              await notify(
+                drv.userId||drv.id,
+                `🗺️ Auto-Route — ${optimised.length} Stops`,
+                `New auto-generated route assigned.\n\nVehicle: ${veh.id}\nDeparting: ${bestWH} Warehouse\n${distKm} km · ~${Math.floor(durMins/60)}h ${durMins%60}m\n\n${stopLines}\n\nCheck "My Route Briefing".`,
+                'info'
+              );
+
+              // Notify warehouse
+              const whUsers=await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+              const cargoList=stopsData.map((s,i)=>`Stop ${i+1}: ${s.city} — ${s.retailer}, ${s.items} items`).join(' | ');
+              for(const u of whUsers.rows){
+                await notify(u.id,`📦 Auto-Route — Prepare ${optimised.length} Stops`,
+                  `Driver: ${drv.name}, Vehicle: ${veh.id}, Warehouse: ${bestWH}.\nCargo: ${cargoList}`,
+                  'info'
+                );
+              }
+
+              // Notify each retailer
+              for(const stop of stopsData){
+                const ord=optimised.find(d=>d.deliveryId===stop.deliveryId);
+                if(ord) await notify(ord.retailerId,'🚚 Your Delivery is Scheduled',
+                  `Your order to ${stop.city} is assigned. Driver: ${drv.name}, Vehicle: ${veh.id}. ETA: ${stop.eta}.`,
+                  'success',ord.orderId
+                );
+              }
+
+              // Notify OPT — summary
+              for(const u of optUsers.rows){
+                await notify(u.id,`✅ Auto-Route Created — ${optimised.length} Orders Dispatched`,
+                  `Batch routed to ${drv.name} (${veh.id}) from ${bestWH} Warehouse. ${distKm} km · ${Math.floor(durMins/60)}h ${durMins%60}m.`,
+                  'success'
+                );
+              }
+
+            } else {
+              // No driver/vehicle — warn OPT
+              for(const u of optUsers.rows){
+                await notify(u.id,'⚠️ Batch Ready — No Driver or Vehicle Available',
+                  `${pendingCount} orders queued but no available driver or vehicle found. Please free up resources.`,
+                  'warning'
+                );
+              }
+            }
+          }
+        } catch(autoErr) {
+          console.error('[auto-batch]', autoErr.message);
         }
       }
     }
