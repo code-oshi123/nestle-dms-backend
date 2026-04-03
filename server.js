@@ -893,6 +893,10 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
     if (['delivered', 'failed'].includes(currentStatus)) {
       return res.status(409).json({ error: `Delivery is already "${currentStatus}" — status cannot be changed.` });
     }
+    // Driver cannot update until warehouse has loaded the vehicle
+    if (['assigned', 'warehouse_ready'].includes(currentStatus)) {
+      return res.status(403).json({ error: 'Warehouse has not finished loading this delivery yet. You will be notified when the vehicle is ready for pickup.' });
+    }
 
     await pool.query(
       'UPDATE "Deliveries" SET status=$1, "updatedAt"=NOW() WHERE id=$2',
