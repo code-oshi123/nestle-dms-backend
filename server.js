@@ -1528,4 +1528,143 @@ app.put('/api/retailers/:id/reset-password', auth, orderTeamOnly, async (req, re
 });
 
 const PORT = process.env.PORT || 3000;
+
+// ══════════════════════════════════════════════
+// SPRINT 2 — GPS TRACKING
+// ══════════════════════════════════════════════
+
+// Driver sends current GPS location (called every 10s when in-transit)
+app.post('/api/tracking/update', auth, async (req, res) => {
+  const { deliveryId, lat, lng } = req.body;
+  if (!deliveryId || lat == null || lng == null)
+    return res.status(400).json({ error: 'deliveryId, lat and lng required' });
+  try {
+    await pool.query(
+      `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
+       VALUES($1,$2,$3,$4,NOW())`,
+      [deliveryId, req.user.userId, lat, lng]
+    );
+    res.json({ ok: true });
+  } catch(e) {
+    // Table might not exist yet — create it on first use
+    if (e.message.includes('does not exist')) {
+      try {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS "VehicleLocations" (
+            id SERIAL PRIMARY KEY,
+            "deliveryId" INTEGER,
+            "driverId"   INTEGER,
+            lat          DECIMAL(10,7),
+            lng          DECIMAL(10,7),
+            "recordedAt" TIMESTAMP DEFAULT NOW()
+          )
+        `);
+        await pool.query(
+          `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
+           VALUES($1,$2,$3,$4,NOW())`,
+          [deliveryId, req.user.userId, lat, lng]
+        );
+        return res.json({ ok: true });
+      } catch(e2) { return res.status(500).json({ error: e2.message }); }
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get latest location for a delivery (polled every 10s by map page)
+app.get('/api/tracking/:deliveryId', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT v.lat, v.lng, v."recordedAt",
+              d."driverName", o.city, o."retailerName",
+              TO_CHAR(v."recordedAt" AT TIME ZONE 'Asia/Colombo','HH24:MI:SS') AS "timeStr"
+       FROM "VehicleLocations" v
+       JOIN "Deliveries" d ON d.id=v."deliveryId"
+       JOIN "Orders"    o ON o.id=d."orderId"
+       WHERE v."deliveryId"=$1
+       ORDER BY v."recordedAt" DESC LIMIT 1`,
+      [req.params.deliveryId]
+    );
+    if (!r.rows.length) return res.json({ found: false });
+    res.json({ found: true, ...r.rows[0] });
+  } catch(e) {
+    res.json({ found: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════
+// SPRINT 2 — PRODUCT WEIGHT (for kg auto-calc)
+// ══════════════════════════════════════════════
+
+// Returns products with weightPerUnit so frontend can auto-calc kg
+app.get('/api/products/weights', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, "productName", "weightPerUnit", "availableUnits"
+       FROM "Stock" ORDER BY "productName"`
+    );
+    res.json(r.rows);
+  } catch(e) {
+    res.json([]);
+  }
+});
+
+
+// ══════════════════════════════════════════════
+// GPS TRACKING
+// ══════════════════════════════════════════════
+
+// Driver sends location (called every 10s when in transit)
+app.post('/api/tracking/update', auth, async (req, res) => {
+  try {
+    const { deliveryId, lat, lng } = req.body;
+    if (!deliveryId || !lat || !lng) return res.status(400).json({ error: 'deliveryId, lat and lng required' });
+    await pool.query(
+      `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
+       VALUES($1,$2,$3,$4,NOW())`,
+      [deliveryId, req.user.userId, lat, lng]
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get latest location for a delivery
+app.get('/api/tracking/:deliveryId', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT vl.lat, vl.lng,
+              TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "recordedAt",
+              d."driverName", d."vehicleId", d.eta, d.status,
+              o.city, o."retailerName"
+       FROM "VehicleLocations" vl
+       JOIN "Deliveries" d ON vl."deliveryId"=d.id
+       JOIN "Orders" o ON d."orderId"=o.id
+       WHERE vl."deliveryId"=$1
+       ORDER BY vl."recordedAt" DESC LIMIT 1`,
+      [req.params.deliveryId]
+    );
+    if (!r.rows.length) return res.json({ found: false });
+    res.json({ found: true, ...r.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get all active tracked deliveries (for map overview)
+app.get('/api/tracking', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT DISTINCT ON (vl."deliveryId")
+              vl."deliveryId", vl.lat, vl.lng,
+              TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "recordedAt",
+              d."driverName", d."vehicleId", d.status,
+              o.city, o."retailerName"
+       FROM "VehicleLocations" vl
+       JOIN "Deliveries" d ON vl."deliveryId"=d.id
+       JOIN "Orders" o ON d."orderId"=o.id
+       WHERE d.status='in-transit'
+       ORDER BY vl."deliveryId", vl."recordedAt" DESC`
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Nestlé DMS API running on port ${PORT}`));
