@@ -380,7 +380,7 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
         o.id
       );
 
-      // ── AUTO BATCH: accumulate confirmed orders, dispatch route every 10 orders ──
+      // ── AUTO BATCH: accumulate confirmed orders, dispatch route every 3 orders (test mode) ──
       if (action === 'confirm') {
         try {
           // 1. Create delivery record and mark order as consolidated
@@ -405,19 +405,19 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
           // 4. Notify OPT of queue progress
           const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
           for (const u of optUsers.rows) {
-            const remaining = 10 - pendingCount;
+            const remaining = 3 - pendingCount;
             await notify(
               u.id,
-              `📦 Order Queued (${pendingCount}/10)`,
-              pendingCount >= 10
+              `📦 Order Queued (${pendingCount}/3)`,
+              pendingCount >= 3
                 ? `${pendingCount} orders ready — auto-route is being created now!`
                 : `Order ${o.id} queued. ${remaining} more order(s) needed to trigger auto-route.`,
-              pendingCount >= 10 ? 'success' : 'info', o.id
+              pendingCount >= 3 ? 'success' : 'info', o.id
             );
           }
 
           // 5. Trigger route creation when batch is full
-          if (pendingCount >= 10) {
+          if (pendingCount >= 3) {
 
             // Fetch all pending deliveries sorted by priority then date
             const batchRes = await pool.query(
@@ -477,13 +477,17 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
 
             // Find available driver
             const drvRes = await pool.query(
-              `SELECT d.id, d.name, COALESCE(u.id,d.id) AS "userId"
+              `SELECT d.id, d.name, COALESCE(u.id, d."userId", d.id) AS "userId"
                FROM "Drivers" d
                LEFT JOIN "Users" u ON lower(u.name)=lower(d.name) AND u.role='distributor'
                WHERE NOT EXISTS (
                  SELECT 1 FROM "Deliveries" del
                  WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
-                   AND (del."driverId"=d.id OR (u.id IS NOT NULL AND del."driverId"=u.id))
+                   AND (
+                     del."driverId" = d.id
+                     OR (u.id IS NOT NULL AND del."driverId" = u.id)
+                     OR (d."userId" IS NOT NULL AND del."driverId" = d."userId")
+                   )
                ) LIMIT 1`
             );
 
@@ -495,8 +499,12 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
                  WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
                    AND del."vehicleId"=v.id
                )
-               AND (v.cap IS NULL OR v.cap=0 OR v.cap>=$1)
-               ORDER BY v.cap ASC LIMIT 1`,
+               AND (
+                 v.cap IS NULL
+                 OR CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) = 0
+                 OR CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) >= $1
+               )
+               ORDER BY CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) ASC LIMIT 1`,
               [totalKg]
             );
 
