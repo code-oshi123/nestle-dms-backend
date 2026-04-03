@@ -643,20 +643,10 @@ app.post('/api/deliveries/consolidate', auth, async (req, res) => {
       created++;
     }
 
-    // ── FIX: Notify route_planner AND warehouse reliably ──
-    const notifyUsers = await pool.query(
-      'SELECT id, role FROM "Users" WHERE role IN (\'route_planner\', \'warehouse\')'
-    );
+    // Notify warehouse only
+    const notifyUsers = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
     for (const u of notifyUsers.rows) {
-      const roleMsg = u.role === 'route_planner'
-        ? `${created} delivery record(s) created. Please assign drivers and vehicles.`
-        : `${created} delivery record(s) incoming. Please prepare cargo for loading.`;
-      await notify(
-        u.id,
-        '📦 Deliveries Ready for Planning',
-        roleMsg,
-        'info'
-      );
+      await notify(u.id, '📦 Deliveries Ready', `${created} delivery record(s) incoming. Please prepare cargo.`, 'info');
     }
 
     res.json({ created });
@@ -928,15 +918,13 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
         req.params.id
       );
 
-      // 2. Notify Order Team, Warehouse, Route Planner
+      // 2. Notify Order Team and Warehouse
       const staff = await pool.query(
-        `SELECT id, role FROM "Users" WHERE role IN ('order_team', 'warehouse', 'route_planner')`
+        `SELECT id, role FROM "Users" WHERE role IN ('order_team', 'warehouse')`
       );
       for (const u of staff.rows) {
         const roleContext = u.role === 'warehouse'
           ? (newStatus === 'delivered' ? ' Delivery bay can be cleared.' : newStatus === 'failed' ? ' May need to re-stock or re-schedule.' : '')
-          : u.role === 'route_planner'
-          ? (newStatus === 'delivered' ? ' Route stop complete.' : newStatus === 'failed' ? ' Consider re-routing or rescheduling.' : '')
           : '';
         await notify(
           u.id,
@@ -964,7 +952,7 @@ app.put('/api/deliveries/:id/status', auth, async (req, res) => {
         );
       }
     }
-    res.json({ ok: true, newStatus, notified: ['retailer', 'order_team', 'warehouse', 'route_planner', 'distributor'] });
+    res.json({ ok: true, newStatus, notified: ['retailer', 'order_team', 'warehouse', 'distributor'] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1324,7 +1312,7 @@ app.get('/api/users', auth, adminOnly, async (req, res) => {
 
 app.post('/api/users', auth, adminOnly, async (req, res) => {
   const { name, email, password, role, avatar } = req.body;
-  const validRoles = ['retailer','order_team','route_planner','warehouse','distributor'];
+  const validRoles = ['retailer','order_team','warehouse','distributor'];
   if (!name||!name.trim())     return res.status(400).json({ error: 'Name is required' });
   if (!email||!email.trim())   return res.status(400).json({ error: 'Email is required' });
   if (!password||password.length<4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
@@ -1420,9 +1408,9 @@ app.put('/api/deliveries/:id/confirm-receipt', auth, async (req, res) => {
       );
     }
 
-    // Notify order team + route planner
+    // Notify order team
     const staff = await pool.query(
-      `SELECT id FROM "Users" WHERE role IN ('order_team','route_planner')`
+      `SELECT id FROM "Users" WHERE role='order_team'`
     );
     for (const u of staff.rows) {
       await notify(
