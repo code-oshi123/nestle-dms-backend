@@ -52,6 +52,22 @@ function auth(req, res, next) {
 // ── health check / keep-alive ─────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Nestlé DMS API' }));
 
+// ── diagnostic endpoint — check vehicles, drivers and pending deliveries
+app.get('/api/debug/routing', async (req, res) => {
+  try {
+    const veh     = await pool.query(`SELECT id, type, cap FROM "Vehicles" ORDER BY id`);
+    const drv     = await pool.query(`SELECT d.id, d.name, d."userId", u.id AS "linkedUserId" FROM "Drivers" d LEFT JOIN "Users" u ON lower(u.name)=lower(d.name) AND u.role='distributor'`);
+    const pending = await pool.query(`SELECT COUNT(*) FROM "Deliveries" WHERE status='pending'`);
+    const dels    = await pool.query(`SELECT id, status, "driverId", "vehicleId" FROM "Deliveries" WHERE status IN ('assigned','warehouse_ready','loaded','in-transit') ORDER BY id`);
+    res.json({
+      vehicles: veh.rows,
+      drivers: drv.rows,
+      pendingDeliveries: parseInt(pending.rows[0].count),
+      activeDeliveries: dels.rows
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════
@@ -546,24 +562,43 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
                    )
                ) LIMIT 1`
             );
+            console.log('[route] available drivers:', drvRes.rows.length, drvRes.rows.map(r=>r.name));
 
             // Find smallest available vehicle that fits total cargo weight
-            const vehRes = await pool.query(
-              `SELECT v.id, v.plate, v.type,
-                      CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) AS cap
-               FROM "Vehicles" v
-               WHERE NOT EXISTS (
-                 SELECT 1 FROM "Deliveries" del
-                 WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
-                   AND del."vehicleId"=v.id
-               )
-               AND (
-                 CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) = 0
-                 OR CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) >= $1
-               )
-               ORDER BY CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) ASC LIMIT 1`,
-              [totalKg]
-            );
+            // cap column may be numeric or text like "5000kg" — handle both
+            let vehRes;
+            try {
+              vehRes = await pool.query(
+                `SELECT v.id, v.plate, v.type,
+                        NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC AS cap
+                 FROM "Vehicles" v
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM "Deliveries" del
+                   WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                     AND del."vehicleId"=v.id
+                 )
+                 AND (
+                   NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '') IS NULL
+                   OR NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC = 0
+                   OR NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC >= $1
+                 )
+                 ORDER BY NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC ASC NULLS LAST
+                 LIMIT 1`,
+                [totalKg]
+              );
+            } catch(vehErr) {
+              console.error('[route] vehicle cap query failed, falling back:', vehErr.message);
+              // Fallback: just pick any available vehicle
+              vehRes = await pool.query(
+                `SELECT id, plate, type, cap FROM "Vehicles" v
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM "Deliveries" del
+                   WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                     AND del."vehicleId"=v.id
+                 ) LIMIT 1`
+              );
+            }
+            console.log('[route] available vehicles:', vehRes.rows.length, vehRes.rows.map(r=>r.id+'(cap:'+r.cap+')'));
 
             if (drvRes.rows.length && vehRes.rows.length) {
               const drv=drvRes.rows[0], veh=vehRes.rows[0];
@@ -642,11 +677,12 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
               const reason = !drvRes.rows.length && !vehRes.rows.length
                 ? 'No available driver or vehicle found'
                 : !drvRes.rows.length
-                ? 'No available driver found'
-                : `No vehicle with capacity ≥ ${totalKg.toFixed(1)}kg available`;
+                ? 'No available driver found (all drivers busy)'
+                : `No vehicle with capacity ≥ ${totalKg.toFixed(1)}kg is available`;
+              console.error('[route] Cannot assign:', reason, '| totalKg:', totalKg, '| drivers:', drvRes.rows.length, '| vehicles:', vehRes.rows.length);
               for(const u of optUsers.rows){
                 await notify(u.id,'⚠️ Batch Ready — Cannot Assign',
-                  `${pendingCount} orders ready (total ${totalKg.toFixed(1)}kg) but cannot auto-assign.\nReason: ${reason}.\nPlease free up a driver or vehicle with sufficient capacity.`,
+                  `${pendingCount} orders queued (total ${totalKg.toFixed(1)}kg) but route could not be auto-assigned.\nReason: ${reason}.\nCheck that at least one driver and one vehicle are free.`,
                   'warning'
                 );
               }
