@@ -565,43 +565,33 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             console.log('[route] available drivers:', drvRes.rows.length, drvRes.rows.map(r=>r.name));
 
             // Find smallest available vehicle that fits total cargo weight
-            // cap column may be numeric or text like "5000kg" — handle both
-            let vehRes;
-            try {
-              vehRes = await pool.query(
-                `SELECT v.id, v.plate, v.type,
-                        NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC AS cap
-                 FROM "Vehicles" v
-                 WHERE NOT EXISTS (
-                   SELECT 1 FROM "Deliveries" del
-                   WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
-                     AND del."vehicleId"=v.id
-                 )
-                 AND (
-                   NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '') IS NULL
-                   OR NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC = 0
-                   OR NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC >= $1
-                 )
-                 ORDER BY NULLIF(regexp_replace(v.cap::text, '[^0-9.]', '', 'g'), '')::NUMERIC ASC NULLS LAST
-                 LIMIT 1`,
-                [totalKg]
-              );
-            } catch(vehErr) {
-              console.error('[route] vehicle cap query failed, falling back:', vehErr.message);
-              // Fallback: just pick any available vehicle
-              vehRes = await pool.query(
-                `SELECT id, plate, type, cap FROM "Vehicles" v
-                 WHERE NOT EXISTS (
-                   SELECT 1 FROM "Deliveries" del
-                   WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
-                     AND del."vehicleId"=v.id
-                 ) LIMIT 1`
-              );
-            }
-            console.log('[route] available vehicles:', vehRes.rows.length, vehRes.rows.map(r=>r.id+'(cap:'+r.cap+')'));
+            // cap is stored as plain numeric text e.g. "5000", "1500", "800"
+            const allVeh = await pool.query(
+              `SELECT id, plate, type, cap FROM "Vehicles" v
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM "Deliveries" del
+                 WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+                   AND del."vehicleId"=v.id
+               ) ORDER BY id`
+            );
+            console.log('[route] all free vehicles:', allVeh.rows.map(r=>r.id+'(cap:'+r.cap+')'));
 
+            // Pick smallest vehicle whose cap >= totalKg (fallback to any if totalKg=0)
+            const freeVehicles = allVeh.rows.map(v => ({
+              ...v,
+              capNum: parseFloat(String(v.cap).replace(/[^0-9.]/g,'')) || 0
+            }));
+            const fittingVehicles = totalKg > 0
+              ? freeVehicles.filter(v => v.capNum === 0 || v.capNum >= totalKg)
+              : freeVehicles;
+            fittingVehicles.sort((a,b) => a.capNum - b.capNum);
+            const vehRes = { rows: fittingVehicles.length ? [fittingVehicles[0]] : [] };
+            console.log('[route] selected vehicle:', vehRes.rows.map(r=>r.id+'(cap:'+r.capNum+'kg, needed:'+totalKg.toFixed(1)+'kg)'));
+
+            console.log('[route] ASSIGNING: drivers='+drvRes.rows.length+' vehicles='+vehRes.rows.length+' totalKg='+totalKg.toFixed(1));
             if (drvRes.rows.length && vehRes.rows.length) {
               const drv=drvRes.rows[0], veh=vehRes.rows[0];
+              console.log('[route] Assigning to driver:', drv.name, '| vehicle:', veh.id, '| cap:', veh.capNum||veh.cap, 'kg');
 
               // Build ETAs — 45 min per stop from now+1hr
               let dH=new Date().getHours()+1, dM=0;
