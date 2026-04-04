@@ -343,9 +343,9 @@ app.post('/api/orders', auth, async (req, res) => {
 
   try {
     const r = await pool.query(
-      `INSERT INTO "Orders"("retailerId","retailerName",city,items,kg,priority,notes,status,"createdAt")
-       VALUES($1,$2,$3,$4,$5,$6,$7,'pending',NOW()) RETURNING id`,
-      [retailerId, retailerName, city, itemsNum, kgNum, priority, notes||'']
+      `INSERT INTO "Orders"("retailerId","retailerName",city,items,kg,priority,notes,"productId",status,"createdAt")
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,'pending',NOW()) RETURNING id`,
+      [retailerId, retailerName, city, itemsNum, kgNum, priority, notes||'', productIdNum]
     );
     const orderId = r.rows[0].id;
 
@@ -679,7 +679,18 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             }
           }
         } catch(autoErr) {
-          console.error('[auto-batch]', autoErr.message);
+          console.error('[auto-batch] CRITICAL ERROR:', autoErr.message, autoErr.stack);
+          try {
+            const optFail = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+            for (const u of optFail.rows) {
+              await notify(
+                u.id,
+                '🔴 Auto-Route Failed (System Error)',
+                `Auto-assignment crashed with error: ${autoErr.message}. Please assign the batch manually.`,
+                'alert'
+              );
+            }
+          } catch {}
         }
       }
     }
