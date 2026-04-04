@@ -380,55 +380,81 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
         o.id
       );
 
-      // ── AUTO BATCH: accumulate confirmed orders, dispatch route every 3 orders (test mode) ──
+      // ── AUTO BATCH: accumulate confirmed orders, dispatch optimised route every 10 orders ──
+      const BATCH_SIZE = 10; // change to 3 for testing
       if (action === 'confirm') {
         try {
-          // 1. Create delivery record and mark order as consolidated
+          // 1. Auto-calculate kg from product weight if kg=0
+          let orderKg = parseFloat(o.kg) || 0;
+          if (orderKg === 0 && o.productId) {
+            const wt = await pool.query(
+              `SELECT "weightPerUnit" FROM "Stock" WHERE id=$1`, [o.productId]
+            );
+            if (wt.rows.length && wt.rows[0].weightPerUnit) {
+              orderKg = parseFloat(wt.rows[0].weightPerUnit) * (parseInt(o.items) || 1);
+              await pool.query(`UPDATE "Orders" SET kg=$1 WHERE id=$2`, [orderKg, o.id]);
+              console.log(`[kg] Order ${o.id}: ${o.items} × ${wt.rows[0].weightPerUnit}kg = ${orderKg}kg`);
+            }
+          }
+
+          // 2. Create delivery record and mark order as consolidated
           await pool.query(
             `INSERT INTO "Deliveries"("orderId",status,"createdAt") VALUES($1,'pending',NOW())`,
             [o.id]
           );
           await pool.query(`UPDATE "Orders" SET status='consolidated' WHERE id=$1`, [o.id]);
 
-          // 2. Notify retailer — order queued
+          // 3. Notify retailer — order queued
           await notify(
             o.retailerId,
             '✅ Order Confirmed — Queued for Dispatch',
-            `Your order ${o.id} to ${o.city} is confirmed and queued. It will be dispatched when the next batch of 10 orders is ready.`,
+            `Your order ${o.id} to ${o.city} (${orderKg.toFixed(1)}kg) is confirmed and queued for the next batch route.`,
             'success', o.id
           );
 
-          // 3. Count unassigned pending deliveries
+          // 4. Count unassigned pending deliveries
           const pendingRes = await pool.query(`SELECT COUNT(*) FROM "Deliveries" WHERE status='pending'`);
           const pendingCount = parseInt(pendingRes.rows[0].count);
 
-          // 4. Notify OPT of queue progress
+          // 5. Notify OPT of queue progress
           const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
           for (const u of optUsers.rows) {
-            const remaining = 3 - pendingCount;
+            const remaining = BATCH_SIZE - pendingCount;
             await notify(
               u.id,
-              `📦 Order Queued (${pendingCount}/3)`,
-              pendingCount >= 3
+              `📦 Order Queued (${pendingCount}/${BATCH_SIZE})`,
+              pendingCount >= BATCH_SIZE
                 ? `${pendingCount} orders ready — auto-route is being created now!`
-                : `Order ${o.id} queued. ${remaining} more order(s) needed to trigger auto-route.`,
-              pendingCount >= 3 ? 'success' : 'info', o.id
+                : `Order ${o.id} queued. ${remaining} more needed to trigger auto-route.`,
+              pendingCount >= BATCH_SIZE ? 'success' : 'info', o.id
             );
           }
 
-          // 5. Trigger route creation when batch is full
-          if (pendingCount >= 3) {
+          // 6. Trigger route creation when batch is full
+          if (pendingCount >= BATCH_SIZE) {
 
-            // Fetch all pending deliveries sorted by priority then date
+            // Fetch all pending deliveries — include calculated kg
             const batchRes = await pool.query(
-              `SELECT d.id AS "deliveryId", o."retailerName", o.city, o.items, o.kg,
-                      o.priority, o."retailerId", o.id AS "orderId"
+              `SELECT d.id AS "deliveryId", o."retailerName", o.city, o.items,
+                      COALESCE(o.kg, 0) AS kg, o.priority, o."retailerId", o.id AS "orderId",
+                      o."productId"
                FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
                WHERE d.status='pending'
                ORDER BY CASE o.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
                         d."createdAt" ASC`
             );
-            const batch = batchRes.rows;
+            let batch = batchRes.rows;
+
+            // Auto-fix any still-zero kg using Stock table
+            for (const row of batch) {
+              if ((parseFloat(row.kg)||0) === 0 && row.productId) {
+                const wt = await pool.query(`SELECT "weightPerUnit" FROM "Stock" WHERE id=$1`, [row.productId]);
+                if (wt.rows.length && wt.rows[0].weightPerUnit) {
+                  row.kg = parseFloat(wt.rows[0].weightPerUnit) * (parseInt(row.items)||1);
+                  await pool.query(`UPDATE "Orders" SET kg=$1 WHERE id=$2`, [row.kg, row.orderId]);
+                }
+              }
+            }
 
             // Haversine distance helper
             const hv = (a,b) => {
@@ -436,6 +462,9 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
               const x=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
               return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
             };
+
+            // Priority score: urgent=0, high=1, normal=2
+            const priScore = p => p==='urgent'?0:p==='high'?1:2;
 
             const CC = {
               'Colombo':{lat:6.9271,lng:79.8612},'Galle':{lat:6.0535,lng:80.2210},
@@ -450,30 +479,52 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
               'Kandy':{lat:7.2906,lng:80.6337},'Kurunegala':{lat:7.4875,lng:80.3647},
             };
 
-            // Nearest-neighbour pass from Colombo to find first stop
-            const rem = [...batch];
-            let cur = WH['Colombo'];
-            const pass1 = [];
-            while (rem.length) {
-              let bi=0,bd=Infinity;
-              rem.forEach((d,i)=>{ const c=CC[d.city]||CC['Colombo']; const dist=hv(cur,c); if(dist<bd){bd=dist;bi=i;} });
-              const ch=rem.splice(bi,1)[0]; pass1.push(ch); cur=CC[ch.city]||CC['Colombo'];
+            // ── SMART ROUTING: Priority-first + nearest-neighbour within each tier ──
+            // Step 1: group by priority
+            const groups = { urgent:[], high:[], normal:[] };
+            batch.forEach(d => {
+              const p = d.priority==='urgent'?'urgent':d.priority==='high'?'high':'normal';
+              groups[p].push(d);
+            });
+
+            // Step 2: nearest-neighbour within each priority group
+            function nearestNeighbour(items, startCoord) {
+              const rem = [...items];
+              const result = [];
+              let cur = startCoord;
+              while (rem.length) {
+                let bi=0, bd=Infinity;
+                rem.forEach((d,i)=>{ const c=CC[d.city]||CC['Colombo']; const dist=hv(cur,c); if(dist<bd){bd=dist;bi=i;} });
+                const ch=rem.splice(bi,1)[0]; result.push(ch); cur=CC[ch.city]||CC['Colombo'];
+              }
+              return result;
             }
 
-            // Find nearest warehouse to first stop
-            const fc=CC[pass1[0].city]||CC['Colombo'];
-            let bestWH='Colombo',bestWHD=Infinity;
-            for(const [wn,wc] of Object.entries(WH)){ const d=hv(fc,wc); if(d<bestWHD){bestWHD=d;bestWH=wn;} }
-
-            // Re-run optimisation from the correct warehouse
-            const rem2=[...batch];
-            let cur2=WH[bestWH];
-            const optimised=[];
-            while(rem2.length){
-              let bi=0,bd=Infinity;
-              rem2.forEach((d,i)=>{ const c=CC[d.city]||CC['Colombo']; const dist=hv(cur2,c); if(dist<bd){bd=dist;bi=i;} });
-              const ch=rem2.splice(bi,1)[0]; optimised.push(ch); cur2=CC[ch.city]||CC['Colombo'];
+            // Step 3: find nearest warehouse to first urgent/high stop (or normal if no others)
+            const firstGroup = groups.urgent.length ? groups.urgent :
+                               groups.high.length   ? groups.high   : groups.normal;
+            const tempFirst = nearestNeighbour(firstGroup, WH['Colombo']);
+            const fc = CC[tempFirst[0]?.city] || CC['Colombo'];
+            let bestWH='Colombo', bestWHD=Infinity;
+            for (const [wn,wc] of Object.entries(WH)) {
+              const d=hv(fc,wc); if(d<bestWHD){bestWHD=d;bestWH=wn;}
             }
+            const whCoord = WH[bestWH];
+
+            // Step 4: optimise each group from current position, chain groups
+            let cur2 = whCoord;
+            const optimised = [];
+            for (const tier of ['urgent','high','normal']) {
+              if (!groups[tier].length) continue;
+              const ordered = nearestNeighbour(groups[tier], cur2);
+              optimised.push(...ordered);
+              cur2 = CC[ordered[ordered.length-1].city] || CC['Colombo'];
+            }
+
+            // ── Calculate total weight of entire route
+            const totalKg = optimised.reduce((sum,d) => sum + (parseFloat(d.kg)||0), 0);
+            console.log(`[route] totalKg=${totalKg.toFixed(1)}, warehouse=${bestWH}, stops=${optimised.length}`);
+            console.log(`[route] urgent=${groups.urgent.length} high=${groups.high.length} normal=${groups.normal.length}`);
 
             // Find available driver
             const drvRes = await pool.query(
@@ -491,17 +542,18 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
                ) LIMIT 1`
             );
 
-            const totalKg = optimised.reduce((s,d)=>s+(parseFloat(d.kg)||0),0);
+            // Find smallest available vehicle that fits total cargo weight
             const vehRes = await pool.query(
-              `SELECT v.id, v.plate, v.type, v.cap FROM "Vehicles" v
+              `SELECT v.id, v.plate, v.type,
+                      CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) AS cap
+               FROM "Vehicles" v
                WHERE NOT EXISTS (
                  SELECT 1 FROM "Deliveries" del
                  WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
                    AND del."vehicleId"=v.id
                )
                AND (
-                 v.cap IS NULL
-                 OR CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) = 0
+                 CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) = 0
                  OR CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) >= $1
                )
                ORDER BY CAST(regexp_replace(v.cap::text, '[^0-9.]', '', 'g') AS NUMERIC) ASC LIMIT 1`,
@@ -544,20 +596,20 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
               } catch(re){ console.error('[auto-route]',re.message); }
 
               // Notify driver — full briefing
-              const stopLines=stopsData.map((s,i)=>`  Stop ${i+1}: ${s.city} — ${s.retailer} (${s.items} items) ETA ${s.eta}`).join('\n');
+              const stopLines=stopsData.map((s,i)=>`  Stop ${i+1}: ${s.city} — ${s.retailer} (${s.items} items, ${parseFloat(optimised[i]?.kg||0).toFixed(1)}kg) [${s.priority||'normal'}] ETA ${s.eta}`).join('\n');
               await notify(
                 drv.userId||drv.id,
-                `🗺️ Auto-Route — ${optimised.length} Stops`,
-                `New auto-generated route assigned.\n\nVehicle: ${veh.id}\nDeparting: ${bestWH} Warehouse\n${distKm} km · ~${Math.floor(durMins/60)}h ${durMins%60}m\n\n${stopLines}\n\nCheck "My Route Briefing".`,
+                `🗺️ Auto-Route — ${optimised.length} Stops · ${totalKg.toFixed(1)}kg`,
+                `New priority-optimised route assigned.\n\nVehicle: ${veh.id} (cap: ${veh.cap}kg)\nDeparting: ${bestWH} Warehouse\nTotal cargo: ${totalKg.toFixed(1)}kg\n${distKm} km · ~${Math.floor(durMins/60)}h ${durMins%60}m\n\nStop sequence (priority-ordered):\n${stopLines}\n\nCheck "My Route Briefing".`,
                 'info'
               );
 
               // Notify warehouse
               const whUsers=await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
-              const cargoList=stopsData.map((s,i)=>`Stop ${i+1}: ${s.city} — ${s.retailer}, ${s.items} items`).join(' | ');
+              const cargoList=stopsData.map((s,i)=>`Stop ${i+1}[${s.priority||'normal'}]: ${s.city} — ${s.retailer}, ${s.items} items (${parseFloat(optimised[i]?.kg||0).toFixed(1)}kg)`).join('\n');
               for(const u of whUsers.rows){
-                await notify(u.id,`📦 Auto-Route — Prepare ${optimised.length} Stops`,
-                  `Driver: ${drv.name}, Vehicle: ${veh.id}, Warehouse: ${bestWH}.\nCargo: ${cargoList}`,
+                await notify(u.id,`📦 Prepare Route — ${optimised.length} Stops · ${totalKg.toFixed(1)}kg`,
+                  `Driver: ${drv.name}\nVehicle: ${veh.id} (capacity: ${veh.cap}kg)\nWarehouse: ${bestWH}\nTotal cargo weight: ${totalKg.toFixed(1)}kg\n\nCargo by stop:\n${cargoList}`,
                   'info'
                 );
               }
@@ -572,18 +624,24 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
               }
 
               // Notify OPT — summary
+              const urgentCount = groups.urgent.length, highCount = groups.high.length, normalCount = groups.normal.length;
               for(const u of optUsers.rows){
-                await notify(u.id,`✅ Auto-Route Created — ${optimised.length} Orders Dispatched`,
-                  `Batch routed to ${drv.name} (${veh.id}) from ${bestWH} Warehouse. ${distKm} km · ${Math.floor(durMins/60)}h ${durMins%60}m.`,
+                await notify(u.id,`✅ Route Created — ${optimised.length} Stops · ${totalKg.toFixed(1)}kg`,
+                  `Priority-optimised route dispatched to ${drv.name} (${veh.id}) from ${bestWH} Warehouse.\n${distKm} km · ${Math.floor(durMins/60)}h ${durMins%60}m · cargo: ${totalKg.toFixed(1)}kg/${veh.cap}kg\nStop breakdown: ${urgentCount} urgent · ${highCount} high · ${normalCount} normal`,
                   'success'
                 );
               }
 
             } else {
-              // No driver/vehicle — warn OPT
+              // No driver/vehicle — warn OPT with weight info
+              const reason = !drvRes.rows.length && !vehRes.rows.length
+                ? 'No available driver or vehicle found'
+                : !drvRes.rows.length
+                ? 'No available driver found'
+                : `No vehicle with capacity ≥ ${totalKg.toFixed(1)}kg available`;
               for(const u of optUsers.rows){
-                await notify(u.id,'⚠️ Batch Ready — No Driver or Vehicle Available',
-                  `${pendingCount} orders queued but no available driver or vehicle found. Please free up resources.`,
+                await notify(u.id,'⚠️ Batch Ready — Cannot Assign',
+                  `${pendingCount} orders ready (total ${totalKg.toFixed(1)}kg) but cannot auto-assign.\nReason: ${reason}.\nPlease free up a driver or vehicle with sufficient capacity.`,
                   'warning'
                 );
               }
