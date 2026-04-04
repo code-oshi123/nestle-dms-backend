@@ -191,27 +191,32 @@ app.get('/api/vehicles', auth, async (req, res) => {
 // Returns available products (backed by the "Stock" table).
 app.get('/api/products', auth, async (req, res) => {
   try {
-    // Be tolerant to different casing/naming for product-name column.
-    // (Some setups create columns with camelCase inside quotes; others may store them lowercase.)
     const queries = [
-      'SELECT id, "productName"  AS "productName" FROM "Stock" ORDER BY "productName"',
+      'SELECT id, "productName" AS "productName" FROM "Stock" ORDER BY "productName"',
       'SELECT id, "productname" AS "productName" FROM "Stock" ORDER BY "productname"',
-      'SELECT id, productName     AS "productName" FROM "Stock" ORDER BY productName',
-      'SELECT id, productname    AS "productName" FROM "Stock" ORDER BY productname',
     ];
+    for (const q of queries) {
+      try { const r = await pool.query(q); if (Array.isArray(r.rows)) return res.json(r.rows); } catch {}
+    }
+    return res.json([]);
+  } catch { return res.json([]); }
+});
 
+// Returns products WITH weight per unit — used by frontend kg auto-calc
+app.get('/api/products/weights', auth, async (req, res) => {
+  try {
+    const queries = [
+      `SELECT id, "productName" AS "productName", "weightPerUnit" FROM "Stock" ORDER BY "productName"`,
+      `SELECT id, "productname" AS "productName", "weightperunit" AS "weightPerUnit" FROM "Stock" ORDER BY "productname"`,
+    ];
     for (const q of queries) {
       try {
         const r = await pool.query(q);
         if (Array.isArray(r.rows)) return res.json(r.rows);
       } catch {}
     }
-
     return res.json([]);
-  } catch (e) {
-    // Stock table might not exist yet; keep frontend usable.
-    return res.json([]);
-  }
+  } catch { return res.json([]); }
 });
 
 // ── Stock check helper ────────────────────────
@@ -381,7 +386,7 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
       );
 
       // ── AUTO BATCH: accumulate confirmed orders, dispatch optimised route every 10 orders ──
-      const BATCH_SIZE = 10; // change to 3 for testing
+      const BATCH_SIZE = 3; // set to 10 for production
       if (action === 'confirm') {
         try {
           // 1. Auto-calculate kg from product weight if kg=0
