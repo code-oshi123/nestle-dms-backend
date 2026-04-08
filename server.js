@@ -64,9 +64,11 @@ pool.on('connect', client => {
 const JWT_SECRET = process.env.JWT_SECRET || 'nestle-dms-secret-change-in-prod';
 
 // ── Middleware: verify JWT token ──────────────
+// Accepts token from Authorization header OR ?token= query param
+// (query param needed for EventSource / SSE, which cannot set custom headers)
 function auth(req, res, next) {
   const header = req.headers['authorization'];
-  const token  = header && header.split(' ')[1];
+  const token  = (header && header.split(' ')[1]) || req.query.token;
   if (!token) return res.status(401).json({ error: 'No token provided' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -1661,49 +1663,145 @@ app.put('/api/retailers/:id/reset-password', auth, orderTeamOnly, async (req, re
 const PORT = process.env.PORT || 3000;
 
 // ══════════════════════════════════════════════
-// SPRINT 2 — GPS TRACKING
+// SPRINT 2 — GPS TRACKING (ADVANCED)
 // ══════════════════════════════════════════════
 
-// Driver sends current GPS location (called every 10s when in-transit)
+/*
+ * ── ADVANCED GPS MIGRATION (run once in Neon):
+ *
+ *  -- Core columns (may already exist):
+ *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS accuracy  NUMERIC;
+ *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS speed     NUMERIC;
+ *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS heading   NUMERIC;
+ *
+ *  -- Keep only last 500 rows per delivery (auto-cleanup):
+ *  CREATE OR REPLACE FUNCTION cleanup_vehicle_locations() RETURNS trigger AS $$
+ *  BEGIN
+ *    DELETE FROM "VehicleLocations"
+ *    WHERE "deliveryId" = NEW."deliveryId"
+ *      AND id NOT IN (
+ *        SELECT id FROM "VehicleLocations"
+ *        WHERE "deliveryId" = NEW."deliveryId"
+ *        ORDER BY "recordedAt" DESC LIMIT 500
+ *      );
+ *    RETURN NEW;
+ *  END;
+ *  $$ LANGUAGE plpgsql;
+ *
+ *  DROP TRIGGER IF EXISTS trg_cleanup_locations ON "VehicleLocations";
+ *  CREATE TRIGGER trg_cleanup_locations
+ *    AFTER INSERT ON "VehicleLocations"
+ *    FOR EACH ROW EXECUTE FUNCTION cleanup_vehicle_locations();
+ */
+
+// ── SSE: per-delivery subscriber registry ──────
+// Map<deliveryId, Set<res>>
+const sseClients = new Map();
+
+function broadcastLocation(deliveryId, payload) {
+  const clients = sseClients.get(String(deliveryId));
+  if (!clients || !clients.size) return;
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  clients.forEach(res => {
+    try { res.write(data); } catch (_) { clients.delete(res); }
+  });
+}
+
+// SSE stream endpoint — frontend subscribes here instead of polling
+app.get('/api/tracking/:deliveryId/stream', auth, (req, res) => {
+  const id = String(req.params.deliveryId);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+  res.flushHeaders();
+  // Send a heartbeat comment every 20s to keep the connection alive
+  const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch(_) { clearInterval(hb); } }, 20000);
+  if (!sseClients.has(id)) sseClients.set(id, new Set());
+  sseClients.get(id).add(res);
+  req.on('close', () => {
+    clearInterval(hb);
+    sseClients.get(id)?.delete(res);
+    if (sseClients.get(id)?.size === 0) sseClients.delete(id);
+  });
+});
+
+// ── Stale driver detection endpoint ────────────
+app.get('/api/tracking/stale', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT DISTINCT ON (vl."deliveryId")
+              vl."deliveryId", d."driverName", d."vehicleId",
+              vl.lat, vl.lng,
+              EXTRACT(EPOCH FROM (NOW() - vl."recordedAt")) AS "secondsAgo",
+              TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "lastSeen"
+       FROM "VehicleLocations" vl
+       JOIN "Deliveries" d ON vl."deliveryId"=d.id
+       WHERE d.status='in-transit'
+       ORDER BY vl."deliveryId", vl."recordedAt" DESC`
+    );
+    const stale = r.rows.filter(row => parseFloat(row.secondsAgo) > 120);
+    res.json(stale);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Breadcrumb trail endpoint ───────────────────
+app.get('/api/tracking/:deliveryId/trail', auth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const r = await pool.query(
+      `SELECT lat, lng, speed, heading, accuracy,
+       TO_CHAR("recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS t
+       FROM "VehicleLocations"
+       WHERE "deliveryId"=$1
+       ORDER BY "recordedAt" DESC LIMIT $2`,
+      [req.params.deliveryId, limit]
+    );
+    // Return oldest-first so the polyline draws correctly
+    res.json(r.rows.reverse());
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Driver sends current GPS location ──────────
+// (called every 10s when in-transit; also pushes via SSE)
 app.post('/api/tracking/update', auth, async (req, res) => {
   try {
     const { deliveryId, lat, lng } = req.body;
     if (!deliveryId || lat === undefined || lng === undefined) {
       return res.status(400).json({ error: 'deliveryId, lat and lng required' });
     }
-    const latNum = parseFloat(lat);
-    const lngNum = parseFloat(lng);
+    const latNum     = parseFloat(lat);
+    const lngNum     = parseFloat(lng);
     if (isNaN(latNum) || isNaN(lngNum)) {
       return res.status(400).json({ error: 'lat and lng must be valid numbers' });
     }
-    // Verify this delivery belongs to this driver before inserting
-    const check = await pool.query(
-      `SELECT d.id FROM "Deliveries" d
-       JOIN "Drivers" dr ON dr.id=d."driverId"
-       WHERE d.id=$1 AND (d."driverId"=$2 OR dr."userId"=$2)
-       LIMIT 1`,
-      [deliveryId, req.user.userId]
-    );
-    // Allow even if check fails (driver may use Drivers.id not Users.id)
-    const accNum     = req.body.accuracy ? parseFloat(req.body.accuracy) : null;
-    const speedNum   = req.body.speed    ? parseFloat(req.body.speed)    : null;
-    const headingNum = req.body.heading  ? parseFloat(req.body.heading)  : null;
+    const accNum     = req.body.accuracy != null ? parseFloat(req.body.accuracy) : null;
+    const speedNum   = req.body.speed    != null ? parseFloat(req.body.speed)    : null;
+    const headingNum = req.body.heading  != null ? parseFloat(req.body.heading)  : null;
 
     // Try inserting with extra columns — fall back if columns don't exist yet
     try {
       await pool.query(
         `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,accuracy,speed,heading,"recordedAt")
          VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
-        [deliveryId, req.user.userId, latNum, lngNum, accNum, speedNum, headingNum]
+        [deliveryId, req.user.id, latNum, lngNum, accNum, speedNum, headingNum]
       );
     } catch {
       await pool.query(
         `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
          VALUES($1,$2,$3,$4,NOW())`,
-        [deliveryId, req.user.userId, latNum, lngNum]
+        [deliveryId, req.user.id, latNum, lngNum]
       );
     }
-    console.log(`[GPS] delivery=${deliveryId} driver=${req.user.userId} lat=${latNum.toFixed(5)} lng=${lngNum.toFixed(5)} acc=${accNum}m speed=${speedNum}m/s`);
+
+    // Push update to any SSE subscribers immediately
+    broadcastLocation(deliveryId, {
+      lat: latNum, lng: lngNum,
+      accuracy: accNum, speed: speedNum, heading: headingNum,
+      recordedAt: new Date().toISOString()
+    });
+
+    console.log(`[GPS] delivery=${deliveryId} driver=${req.user.id} lat=${latNum.toFixed(5)} lng=${lngNum.toFixed(5)} acc=${accNum}m spd=${speedNum}m/s hdg=${headingNum}°`);
     res.json({ ok: true });
   } catch(e) {
     console.error('[GPS update error]', e.message);
@@ -1711,12 +1809,13 @@ app.post('/api/tracking/update', auth, async (req, res) => {
   }
 });
 
-// Get latest location for a delivery
+// ── Get latest location for one delivery ───────
 app.get('/api/tracking/:deliveryId', auth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT vl.lat, vl.lng,
+      `SELECT vl.lat, vl.lng, vl.accuracy, vl.speed, vl.heading,
               TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "recordedAt",
+              EXTRACT(EPOCH FROM (NOW() - vl."recordedAt")) AS "secondsAgo",
               d."driverName", d."vehicleId", d.eta, d.status,
               o.city, o."retailerName"
        FROM "VehicleLocations" vl
@@ -1731,7 +1830,7 @@ app.get('/api/tracking/:deliveryId', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get all active tracked deliveries (for map overview)
+// ── Get all active tracked deliveries (map overview) ──
 app.get('/api/tracking', auth, async (req, res) => {
   try {
     const r = await pool.query(
