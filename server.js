@@ -2241,4 +2241,66 @@ app.get('/api/stock', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════
+// AI ASSISTANT PROXY — keeps Anthropic API key safe on server
+// Set ANTHROPIC_API_KEY in Render environment variables
+// ══════════════════════════════════════════════
+app.post('/api/ai/chat', auth, async (req, res) => {
+  const { messages, systemPrompt } = req.body;
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'messages array required' });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'AI service not configured. Please set ANTHROPIC_API_KEY in Render environment variables.' });
+  }
+
+  try {
+    const https = require('https');
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: systemPrompt || 'You are a helpful delivery management assistant.',
+      messages
+    });
+
+    const response = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.anthropic.com',
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      };
+      const req2 = https.request(options, (resp) => {
+        let data = '';
+        resp.on('data', chunk => data += chunk);
+        resp.on('end', () => {
+          try { resolve({ status: resp.statusCode, body: JSON.parse(data) }); }
+          catch(e) { reject(new Error('Invalid JSON from Anthropic: ' + data.slice(0,200))); }
+        });
+      });
+      req2.on('error', reject);
+      req2.write(body);
+      req2.end();
+    });
+
+    if (response.status !== 200) {
+      console.error('[AI proxy] Anthropic error:', response.status, JSON.stringify(response.body));
+      return res.status(response.status).json({ error: response.body?.error?.message || 'AI service error' });
+    }
+
+    const text = (response.body.content || []).map(c => c.text || '').join('');
+    res.json({ text, usage: response.body.usage });
+  } catch(e) {
+    console.error('[AI proxy error]', e.message);
+    res.status(500).json({ error: 'AI service temporarily unavailable: ' + e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`Nestlé DMS API running on port ${PORT}`));
