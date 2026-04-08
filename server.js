@@ -2259,7 +2259,7 @@ app.post('/api/ai/chat', auth, async (req, res) => {
   try {
     const https = require('https');
     const body = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 1000,
       system: systemPrompt || 'You are a helpful delivery management assistant.',
       messages
