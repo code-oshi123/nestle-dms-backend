@@ -24,6 +24,33 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/*
+ * ── GPS IMPROVEMENT MIGRATION (run once in Neon):
+ *
+ *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS accuracy  NUMERIC;
+ *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS speed     NUMERIC;
+ *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS heading   NUMERIC;
+ *
+ *  -- Keep only last 500 rows per delivery (auto-cleanup):
+ *  CREATE OR REPLACE FUNCTION cleanup_vehicle_locations() RETURNS trigger AS $$
+ *  BEGIN
+ *    DELETE FROM "VehicleLocations"
+ *    WHERE "deliveryId" = NEW."deliveryId"
+ *      AND id NOT IN (
+ *        SELECT id FROM "VehicleLocations"
+ *        WHERE "deliveryId" = NEW."deliveryId"
+ *        ORDER BY "recordedAt" DESC LIMIT 500
+ *      );
+ *    RETURN NEW;
+ *  END;
+ *  $$ LANGUAGE plpgsql;
+ *
+ *  DROP TRIGGER IF EXISTS trg_cleanup_locations ON "VehicleLocations";
+ *  CREATE TRIGGER trg_cleanup_locations
+ *    AFTER INSERT ON "VehicleLocations"
+ *    FOR EACH ROW EXECUTE FUNCTION cleanup_vehicle_locations();
+ */
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -1658,12 +1685,25 @@ app.post('/api/tracking/update', auth, async (req, res) => {
       [deliveryId, req.user.userId]
     );
     // Allow even if check fails (driver may use Drivers.id not Users.id)
-    await pool.query(
-      `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
-       VALUES($1,$2,$3,$4,NOW())`,
-      [deliveryId, req.user.userId, latNum, lngNum]
-    );
-    console.log(`[GPS] delivery=${deliveryId} driver=${req.user.userId} lat=${latNum.toFixed(5)} lng=${lngNum.toFixed(5)}`);
+    const accNum     = req.body.accuracy ? parseFloat(req.body.accuracy) : null;
+    const speedNum   = req.body.speed    ? parseFloat(req.body.speed)    : null;
+    const headingNum = req.body.heading  ? parseFloat(req.body.heading)  : null;
+
+    // Try inserting with extra columns — fall back if columns don't exist yet
+    try {
+      await pool.query(
+        `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,accuracy,speed,heading,"recordedAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
+        [deliveryId, req.user.userId, latNum, lngNum, accNum, speedNum, headingNum]
+      );
+    } catch {
+      await pool.query(
+        `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
+         VALUES($1,$2,$3,$4,NOW())`,
+        [deliveryId, req.user.userId, latNum, lngNum]
+      );
+    }
+    console.log(`[GPS] delivery=${deliveryId} driver=${req.user.userId} lat=${latNum.toFixed(5)} lng=${lngNum.toFixed(5)} acc=${accNum}m speed=${speedNum}m/s`);
     res.json({ ok: true });
   } catch(e) {
     console.error('[GPS update error]', e.message);
@@ -1697,10 +1737,14 @@ app.get('/api/tracking', auth, async (req, res) => {
     const r = await pool.query(
       `SELECT DISTINCT ON (vl."deliveryId")
               vl."deliveryId", vl.lat, vl.lng,
+              vl.accuracy, vl.speed, vl.heading,
               TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "recordedAt",
               EXTRACT(EPOCH FROM (NOW() - vl."recordedAt")) AS "secondsAgo",
               d."driverName", d."vehicleId", d.status, d.eta,
-              o.city, o."retailerName"
+              o.city, o."retailerName",
+              (SELECT COUNT(*) FROM "Deliveries" d2
+               WHERE d2."driverId"=d."driverId"
+                 AND d2.status NOT IN ('delivered','failed')) AS "stopsRemaining"
        FROM "VehicleLocations" vl
        JOIN "Deliveries" d ON vl."deliveryId"=d.id
        JOIN "Orders" o ON d."orderId"=o.id
