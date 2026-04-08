@@ -294,7 +294,7 @@ app.get('/api/orders', auth, async (req, res) => {
     let r;
     if (role === 'retailer') {
       r = await pool.query(
-        `SELECT o.id, o.city, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason",
+        `SELECT o.id, o.city, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason", COALESCE(o."rejectCategory",'other') AS "rejectCategory",
          TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
          d.id AS "deliveryId", d.status AS "deliveryStatus",
          d."receiptConfirmed", TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
@@ -307,7 +307,7 @@ app.get('/api/orders', auth, async (req, res) => {
     } else {
       r = await pool.query(
         `SELECT id, "retailerName" AS retailer, city, items, kg,
-         priority AS prio, status, "confirmedBy", "rejectReason",
+         priority AS prio, status, "confirmedBy", "rejectReason", COALESCE("rejectCategory",'other') AS "rejectCategory",
          TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created
          FROM "Orders" ORDER BY "createdAt" DESC`
       );
@@ -391,40 +391,95 @@ app.post('/api/orders', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/orders/:id/confirm', auth, async (req, res) => {
-  const { action, confirmedBy, rejectReason } = req.body;
+// ── Actionable rejection messages per category
+function getRejectionMessage(category, reason, order) {
+  const base = `Your order ${order.id} to ${order.city} has been rejected.`;
+  const messages = {
+    out_of_stock:       `${base}
 
-  // ── FIX: Require a reason when rejecting ──
+Reason: The product is temporarily out of stock. You will be notified automatically when stock is replenished — no action needed right now.`,
+    duplicate_order:    `${base}
+
+Reason: You already have an active order for this product. Please check My Orders before submitting again.`,
+    coverage_area:      `${base}
+
+Reason: We do not currently deliver to ${order.city}. Please contact your account manager to request coverage expansion.`,
+    suspicious_quantity:`${base}
+
+Reason: The quantity of ${order.items} units seems unusual. Please resubmit with the correct quantity or contact our Order Team directly.`,
+    credit_hold:        `${base}
+
+Reason: Your account has a pending balance. Please settle your account to resume ordering.`,
+    product_discontinued:`${base}
+
+Reason: This product has been discontinued from our catalogue. Please contact your account manager for alternatives.`,
+    other:              `${base}
+
+Reason: ${reason}
+
+Please correct your order and resubmit, or contact our Order Team for assistance.`,
+  };
+  return messages[category] || messages.other;
+}
+
+app.put('/api/orders/:id/confirm', auth, async (req, res) => {
+  const { action, confirmedBy, rejectReason, rejectCategory } = req.body;
+
   if (action === 'reject' && (!rejectReason || rejectReason.trim() === '')) {
     return res.status(400).json({ error: 'A rejection reason is required' });
+  }
+  if (action === 'reject' && (!rejectCategory || rejectCategory.trim() === '')) {
+    return res.status(400).json({ error: 'A rejection category is required' });
   }
 
   const status = action === 'confirm' ? 'confirmed' : 'rejected';
   try {
-    // Only allow action on pending orders
     const check = await pool.query('SELECT status FROM "Orders" WHERE id=$1', [req.params.id]);
     if (!check.rows.length) return res.status(404).json({ error: 'Order not found' });
     if (check.rows[0].status !== 'pending') {
       return res.status(400).json({ error: `Order is already "${check.rows[0].status}" — cannot change` });
     }
 
-    await pool.query(
-      'UPDATE "Orders" SET status=$1,"confirmedBy"=$2,"rejectReason"=$3 WHERE id=$4',
-      [status, confirmedBy, rejectReason||null, req.params.id]
-    );
+    // Store category alongside reason
+    try {
+      await pool.query(
+        `UPDATE "Orders" SET status=$1,"confirmedBy"=$2,"rejectReason"=$3,"rejectCategory"=$4 WHERE id=$5`,
+        [status, confirmedBy, rejectReason||null, rejectCategory||null, req.params.id]
+      );
+    } catch {
+      // rejectCategory column may not exist yet — add it then retry
+      await pool.query(`ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "rejectCategory" VARCHAR(50)`);
+      await pool.query(
+        `UPDATE "Orders" SET status=$1,"confirmedBy"=$2,"rejectReason"=$3,"rejectCategory"=$4 WHERE id=$5`,
+        [status, confirmedBy, rejectReason||null, rejectCategory||null, req.params.id]
+      );
+    }
 
     const order = await pool.query('SELECT * FROM "Orders" WHERE id=$1', [req.params.id]);
     const o = order.rows[0];
     if (o) {
-      // ── FIX: Notify retailer ──
-      const msg = action === 'confirm'
-        ? `Your order ${o.id} to ${o.city} has been confirmed ✅. It will be processed for delivery.`
-        : `Your order ${o.id} to ${o.city} was rejected ❌. Reason: ${rejectReason}. You may correct and resubmit.`;
+      let msg, notifType;
+      if (action === 'confirm') {
+        msg = `Your order ${o.id} to ${o.city} has been confirmed ✅. It will be processed for delivery.`;
+        notifType = 'success';
+      } else {
+        msg = getRejectionMessage(rejectCategory, rejectReason, o);
+        notifType = 'alert';
+
+        // ── If rejected for out_of_stock, register a stock watch
+        if (rejectCategory === 'out_of_stock' && o.productId) {
+          try {
+            await pool.query(`ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "stockWatchActive" BOOLEAN DEFAULT false`);
+            await pool.query(`UPDATE "Orders" SET "stockWatchActive"=true WHERE id=$1`, [o.id]);
+            console.log(`[stock-watch] Registered watch for order ${o.id} product ${o.productId}`);
+          } catch(e) { console.warn('[stock-watch setup]', e.message); }
+        }
+      }
       await notify(
         o.retailerId,
         action === 'confirm' ? 'Order Confirmed ✅' : 'Order Rejected ❌',
         msg,
-        action === 'confirm' ? 'success' : 'alert',
+        notifType,
         o.id
       );
 
@@ -2116,6 +2171,71 @@ app.get('/api/tracking', auth, async (req, res) => {
        WHERE d.status IN ('in-transit','loaded')
          AND vl."recordedAt" > NOW() - INTERVAL '2 hours'
        ORDER BY vl."deliveryId", vl."recordedAt" DESC`
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Stock Restocked Notification (call when warehouse updates stock)
+app.put('/api/stock/:id/update', auth, async (req, res) => {
+  const { availableUnits, availableKg } = req.body;
+  const productId = req.params.id;
+  try {
+    // Update stock levels
+    await pool.query(
+      `UPDATE "Stock" SET "availableUnits"=$1, "availableKg"=$2 WHERE id=$3`,
+      [availableUnits, availableKg, productId]
+    );
+
+    // Check for orders that were rejected for out_of_stock and are watching this product
+    let watchedOrders = [];
+    try {
+      watchedOrders = (await pool.query(
+        `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items, o.kg,
+                o.priority, o.product, s."productName"
+         FROM "Orders" o
+         JOIN "Stock" s ON s.id=$1
+         WHERE o."productId"=$1
+           AND o.status='rejected'
+           AND o."rejectCategory"='out_of_stock'
+           AND o."stockWatchActive"=true
+           AND o.items <= $2`,
+        [productId, availableUnits]
+      )).rows;
+    } catch(e) { console.warn('[stock-watch query]', e.message); }
+
+    // Notify each watching retailer
+    for (const o of watchedOrders) {
+      await notify(
+        o.retailerId,
+        '🟢 Stock Restocked — Resubmit Your Order',
+        `Good news! ${o.productName||'The product'} you ordered is back in stock.
+
+Your previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.
+
+Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
+        'success',
+        o.id
+      );
+      // Clear the watch flag
+      try {
+        await pool.query(`UPDATE "Orders" SET "stockWatchActive"=false WHERE id=$1`, [o.id]);
+      } catch {}
+      console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id} — stock restored`);
+    }
+
+    res.json({ ok: true, restockedCount: watchedOrders.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Get all stock levels (for warehouse stock management page)
+app.get('/api/stock', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, "productName", "availableUnits", "availableKg", "weightPerUnit",
+       (SELECT COUNT(*) FROM "Orders" WHERE "productId"=s.id AND status='rejected'
+        AND "rejectCategory"='out_of_stock' AND "stockWatchActive"=true) AS "watchCount"
+       FROM "Stock" ORDER BY "productName"`
     );
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
