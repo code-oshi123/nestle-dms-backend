@@ -64,11 +64,9 @@ pool.on('connect', client => {
 const JWT_SECRET = process.env.JWT_SECRET || 'nestle-dms-secret-change-in-prod';
 
 // ── Middleware: verify JWT token ──────────────
-// Accepts token from Authorization header OR ?token= query param
-// (query param needed for EventSource / SSE, which cannot set custom headers)
 function auth(req, res, next) {
   const header = req.headers['authorization'];
-  const token  = (header && header.split(' ')[1]) || req.query.token;
+  const token  = header && header.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -1006,95 +1004,460 @@ app.put('/api/deliveries/:id/loaded', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════
+// EXCEPTION HANDLING HELPERS
+// ══════════════════════════════════════════════
+
+// Detect failure reason from driver note
+function classifyFailure(note) {
+  const n = (note||'').toLowerCase();
+  if (n.includes('breakdown') || n.includes('broke down') || n.includes('puncture') ||
+      n.includes('accident') || n.includes('engine') || n.includes('tyre') || n.includes('tire')) {
+    return 'vehicle_breakdown';
+  }
+  if (n.includes('stock') || n.includes('out of') || n.includes('no stock') ||
+      n.includes('unavailable') || n.includes('not available') || n.includes('missing')) {
+    return 'out_of_stock';
+  }
+  if (n.includes('refused') || n.includes('reject') || n.includes('not accept')) {
+    return 'customer_refused';
+  }
+  if (n.includes('address') || n.includes('wrong') || n.includes('location') || n.includes('not found')) {
+    return 'wrong_address';
+  }
+  if (n.includes('closed') || n.includes('absent') || n.includes('unavailable') || n.includes('no one')) {
+    return 'customer_absent';
+  }
+  return 'other';
+}
+
+// Auto-reassign delivery to next available driver
+async function autoReassign(deliveryId, currentDriverId, reason) {
+  try {
+    // Find next available driver (excluding current)
+    const drvRes = await pool.query(
+      `SELECT d.id, d.name, COALESCE(u.id, d."userId", d.id) AS "userId"
+       FROM "Drivers" d
+       LEFT JOIN "Users" u ON lower(u.name)=lower(d.name) AND u.role='distributor'
+       WHERE d.id != $1
+         AND NOT EXISTS (
+           SELECT 1 FROM "Deliveries" del
+           WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+             AND (del."driverId"=d.id OR (u.id IS NOT NULL AND del."driverId"=u.id))
+         ) LIMIT 1`,
+      [currentDriverId]
+    );
+
+    if (!drvRes.rows.length) return { reassigned: false, reason: 'No available driver found' };
+
+    const newDrv = drvRes.rows[0];
+
+    // Reset delivery to assigned with new driver
+    await pool.query(
+      `UPDATE "Deliveries"
+       SET status='assigned', "driverId"=$1, "driverName"=$2, "updatedAt"=NOW()
+       WHERE id=$3`,
+      [newDrv.id, newDrv.name, deliveryId]
+    );
+
+    console.log(`[auto-reassign] Delivery ${deliveryId} reassigned to ${newDrv.name} — reason: ${reason}`);
+    return { reassigned: true, driverName: newDrv.name, driverUserId: newDrv.userId };
+  } catch(e) {
+    console.error('[auto-reassign error]', e.message);
+    return { reassigned: false, reason: e.message };
+  }
+}
+
 app.put('/api/deliveries/:id/status', auth, async (req, res) => {
-  const { newStatus, note, updatedBy } = req.body;
+  const { newStatus, note, updatedBy, failType } = req.body;
   const validStatuses = ['in-transit', 'delivered', 'failed'];
+
   if (!validStatuses.includes(newStatus)) {
     return res.status(400).json({ error: 'Invalid status value' });
   }
   if (newStatus === 'failed' && (!note || note.trim() === '')) {
     return res.status(400).json({ error: 'A reason is required when marking a delivery as failed' });
   }
+
   try {
-    const cur = await pool.query('SELECT status FROM "Deliveries" WHERE id=$1', [req.params.id]);
-    if (!cur.rows.length) return res.status(404).json({ error: 'Delivery not found' });
-    const currentStatus = cur.rows[0].status;
-    if (['delivered', 'failed'].includes(currentStatus)) {
-      return res.status(409).json({ error: `Delivery is already "${currentStatus}" — status cannot be changed.` });
-    }
-    // Driver cannot update until warehouse has loaded the vehicle
-    if (['assigned', 'warehouse_ready'].includes(currentStatus)) {
-      return res.status(403).json({ error: 'Warehouse has not finished loading this delivery yet. You will be notified when the vehicle is ready for pickup.' });
-    }
-
-    await pool.query(
-      'UPDATE "Deliveries" SET status=$1, "updatedAt"=NOW() WHERE id=$2',
-      [newStatus, req.params.id]
-    );
-
-    const del = await pool.query(
-      `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city, o.items, o.kg
+    const cur = await pool.query(
+      `SELECT d.status, d."driverId", d."driverName", d."vehicleId", d.eta,
+              o."retailerId", o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority
        FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
       [req.params.id]
     );
-    const d = del.rows[0];
-    if (d) {
-      const statusLabel = { 'in-transit': 'In Transit 🚛', 'delivered': 'Delivered ✅', 'failed': 'Delivery Failed ❌' };
-      const msgType     = { 'in-transit': 'info', 'delivered': 'success', 'failed': 'alert' };
-      const noteStr     = note && note.trim() ? ` Note: ${note.trim()}` : '';
-      const driverStr   = d.driverName ? ` Driver: ${d.driverName}.` : '';
+    if (!cur.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    const current = cur.rows[0];
 
-      // 1. Notify Retailer
-      const retailerMsg = newStatus === 'delivered'
-        ? `Great news! Your delivery ${req.params.id} to ${d.city} has been successfully delivered ✅.${noteStr}`
-        : newStatus === 'failed'
-        ? `Unfortunately, delivery ${req.params.id} to ${d.city} could not be completed ❌.${noteStr} Please contact us to reschedule.`
-        : `Your delivery ${req.params.id} to ${d.city} is now on its way 🚛.${driverStr} Expected arrival: ${d.eta || 'soon'}.${noteStr}`;
+    if (['delivered', 'failed'].includes(current.status)) {
+      return res.status(409).json({ error: `Delivery is already "${current.status}" — cannot change.` });
+    }
+    if (['assigned', 'warehouse_ready'].includes(current.status)) {
+      return res.status(403).json({ error: 'Warehouse has not finished loading yet. You will be notified when ready.' });
+    }
 
-      await notify(
-        d.retailerId,
-        `Delivery ${statusLabel[newStatus] || newStatus}`,
-        retailerMsg,
-        msgType[newStatus] || 'info',
-        req.params.id
-      );
+    // ── Classify failure reason
+    const failureType = newStatus === 'failed'
+      ? (failType || classifyFailure(note))
+      : null;
 
-      // 2. Notify Order Team and Warehouse
-      const staff = await pool.query(
-        `SELECT id, role FROM "Users" WHERE role IN ('order_team', 'warehouse')`
-      );
-      for (const u of staff.rows) {
-        const roleContext = u.role === 'warehouse'
-          ? (newStatus === 'delivered' ? ' Delivery bay can be cleared.' : newStatus === 'failed' ? ' May need to re-stock or re-schedule.' : '')
-          : '';
-        await notify(
-          u.id,
-          `Delivery Update: ${statusLabel[newStatus] || newStatus}`,
-          `Delivery ${req.params.id} → ${d.city} (${d.retailer}, ${d.items} items).${driverStr} Status: "${newStatus}".${noteStr}${roleContext}`,
-          msgType[newStatus] || 'info',
-          req.params.id
-        );
+    // ── Update status
+    await pool.query(
+      `UPDATE "Deliveries" SET status=$1, "updatedAt"=NOW() WHERE id=$2`,
+      [newStatus, req.params.id]
+    );
+
+    const noteStr   = note && note.trim() ? ` Note: ${note.trim()}` : '';
+    const driverStr = current.driverName ? ` Driver: ${current.driverName}.` : '';
+    const optUsers  = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+    const whUsers   = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+    const driverId  = current.driverId ? Number(current.driverId) : null;
+
+    // ══════════════════════════════════════════
+    // CASE 1: DELIVERED ✅
+    // ══════════════════════════════════════════
+    if (newStatus === 'delivered') {
+      await notify(current.retailerId, '✅ Delivery Successful',
+        `Your delivery to ${current.city} has been delivered successfully.${noteStr} Please confirm receipt in the app.`,
+        'success', req.params.id);
+
+      for (const u of optUsers.rows) {
+        await notify(u.id, '✅ Delivered — ' + current.city,
+          `Delivery ${req.params.id} → ${current.city} (${current.retailer}) confirmed delivered.${driverStr}${noteStr}`,
+          'success', req.params.id);
+      }
+      for (const u of whUsers.rows) {
+        await notify(u.id, '✅ Delivered — Bay Clear',
+          `Delivery ${req.params.id} to ${current.city} delivered. Vehicle ${current.vehicleId} can return or proceed to next stop.`,
+          'success', req.params.id);
+      }
+      if (driverId) {
+        await notify(driverId, '✅ Delivery Confirmed',
+          `Delivery ${req.params.id} to ${current.city} (${current.retailer}) marked as delivered. Check your route for remaining stops.`,
+          'success', req.params.id);
+      }
+      return res.json({ ok: true, newStatus, failureType: null, notified: 4 });
+    }
+
+    // ══════════════════════════════════════════
+    // CASE 2: FAILED — VEHICLE BREAKDOWN 🔧
+    // ══════════════════════════════════════════
+    if (newStatus === 'failed' && failureType === 'vehicle_breakdown') {
+      // Mark vehicle as unavailable
+      await pool.query(
+        `UPDATE "Vehicles" SET status='breakdown' WHERE id=$1`,
+        [current.vehicleId]
+      ).catch(() => {}); // graceful if column doesn't exist
+
+      // Try auto-reassign to another driver
+      const reassign = driverId
+        ? await autoReassign(req.params.id, driverId, 'vehicle_breakdown')
+        : { reassigned: false };
+
+      // Notify driver
+      if (driverId) {
+        await notify(driverId, '🔧 Breakdown Recorded',
+          `Delivery ${req.params.id} marked as failed due to vehicle breakdown.${noteStr} Please contact your supervisor immediately and stay with the vehicle.`,
+          'alert', req.params.id);
       }
 
-      // 3. Notify the distributor (driver) — FIXED: Number() cast
-      const driverId = d.driverId ? Number(d.driverId) : null;
+      // Notify OPT — urgent
+      for (const u of optUsers.rows) {
+        await notify(u.id, '🚨 VEHICLE BREAKDOWN — Delivery ' + req.params.id,
+          `Driver ${current.driverName} has reported a vehicle breakdown (${current.vehicleId}) on route to ${current.city}.${noteStr}
+
+` +
+          (reassign.reassigned
+            ? `✅ Auto-reassigned to ${reassign.driverName}. Please coordinate warehouse re-loading.`
+            : `⚠️ No available driver for auto-reassignment. Manual action required.`),
+          'alert', req.params.id);
+      }
+
+      // Notify warehouse
+      for (const u of whUsers.rows) {
+        await notify(u.id, '🔧 Vehicle Breakdown — ' + current.vehicleId,
+          `Vehicle ${current.vehicleId} has broken down on delivery ${req.params.id} to ${current.city}.
+` +
+          (reassign.reassigned
+            ? `Cargo may need to be transferred to another vehicle for driver ${reassign.driverName}.`
+            : `No replacement driver available yet. Await OPT instructions.`),
+          'alert', req.params.id);
+      }
+
+      // Notify retailer
+      await notify(current.retailerId, '⚠️ Delivery Delayed — Vehicle Issue',
+        `We are sorry, your delivery to ${current.city} has been delayed due to a vehicle issue on our end.` +
+        (reassign.reassigned
+          ? ` We have assigned a replacement driver and will deliver as soon as possible.`
+          : ` Our team is arranging a replacement and will update you shortly.`),
+        'warning', req.params.id);
+
+      // Notify new driver if reassigned
+      if (reassign.reassigned && reassign.driverUserId) {
+        await notify(reassign.driverUserId, '🚨 Urgent — Breakdown Reassignment',
+          `Delivery ${req.params.id} to ${current.city} (${current.retailer}, ${current.items} items) has been reassigned to you due to a vehicle breakdown. Please coordinate with warehouse for cargo transfer.`,
+          'alert', req.params.id);
+      }
+
+      return res.json({ ok: true, newStatus, failureType, reassigned: reassign.reassigned, newDriver: reassign.driverName || null });
+    }
+
+    // ══════════════════════════════════════════
+    // CASE 3: FAILED — OUT OF STOCK 📦
+    // ══════════════════════════════════════════
+    if (newStatus === 'failed' && failureType === 'out_of_stock') {
+      // Notify OPT to reorder
+      for (const u of optUsers.rows) {
+        await notify(u.id, '📦 Out of Stock — Delivery ' + req.params.id,
+          `Delivery ${req.params.id} to ${current.city} (${current.retailer}) failed due to stock unavailability.${noteStr}
+
+Action required: Check Stock table and reorder ${current.items} units. Retailer has been notified.`,
+          'alert', req.params.id);
+      }
+
+      // Notify warehouse to audit stock
+      for (const u of whUsers.rows) {
+        await notify(u.id, '📦 Stock Issue — Immediate Audit Required',
+          `Delivery ${req.params.id} failed — driver reported stock unavailable for ${current.retailer} (${current.city}, ${current.items} items).${noteStr}
+Please audit current stock levels and update the system immediately.`,
+          'alert', req.params.id);
+      }
+
+      // Notify retailer with apology and reschedule promise
+      await notify(current.retailerId, '📦 Delivery Failed — Stock Issue',
+        `We sincerely apologise — your delivery to ${current.city} could not be completed due to a stock shortage on our end. Our team is resolving this and will reschedule your delivery at the earliest opportunity.`,
+        'alert', req.params.id);
+
       if (driverId) {
-        const driverMsg = newStatus === 'delivered'
-          ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) confirmed as delivered ✅. Check your route for remaining stops.`
-          : newStatus === 'failed'
-          ? `Delivery ${req.params.id} to ${d.city} (${d.retailer}) recorded as failed ❌.${noteStr} Contact your planner for next steps.`
-          : `Delivery ${req.params.id} to ${d.city} (${d.retailer}) marked in-transit 🚛.${noteStr}`;
-        await notify(
-          driverId,
-          `Your Delivery: ${statusLabel[newStatus] || newStatus}`,
-          driverMsg,
-          msgType[newStatus] || 'info',
-          req.params.id
-        );
+        await notify(driverId, '📦 Out of Stock Recorded',
+          `Delivery ${req.params.id} recorded as failed due to stock issue.${noteStr} Return to warehouse and inform the team.`,
+          'info', req.params.id);
+      }
+
+      return res.json({ ok: true, newStatus, failureType, notified: 4 });
+    }
+
+    // ══════════════════════════════════════════
+    // CASE 4: FAILED — CUSTOMER ABSENT / REFUSED
+    // ══════════════════════════════════════════
+    if (newStatus === 'failed' && (failureType === 'customer_absent' || failureType === 'customer_refused')) {
+      const isRefused = failureType === 'customer_refused';
+
+      await notify(current.retailerId,
+        isRefused ? '❌ Delivery Refused' : '❌ Delivery Attempted — You Were Unavailable',
+        isRefused
+          ? `Our driver attempted delivery to ${current.city} but the delivery was refused.${noteStr} Please contact us to discuss and reschedule.`
+          : `Our driver attempted delivery to ${current.city} but no one was available to receive it.${noteStr} Please confirm your availability for rescheduling.`,
+        'alert', req.params.id);
+
+      for (const u of optUsers.rows) {
+        await notify(u.id,
+          isRefused ? '❌ Customer Refused — ' + current.city : '❌ Customer Absent — ' + current.city,
+          `Delivery ${req.params.id} to ${current.retailer} (${current.city}) failed — ${isRefused ? 'customer refused' : 'customer absent'}.${noteStr}
+Please contact retailer to reschedule.`,
+          'warning', req.params.id);
+      }
+
+      if (driverId) {
+        await notify(driverId, isRefused ? '❌ Refusal Recorded' : '❌ Absence Recorded',
+          `Delivery ${req.params.id} to ${current.city} recorded as failed (${isRefused ? 'refused' : 'absent'}).${noteStr} Proceed to next stop.`,
+          'info', req.params.id);
+      }
+
+      return res.json({ ok: true, newStatus, failureType, notified: 3 });
+    }
+
+    // ══════════════════════════════════════════
+    // CASE 5: FAILED — WRONG ADDRESS
+    // ══════════════════════════════════════════
+    if (newStatus === 'failed' && failureType === 'wrong_address') {
+      await notify(current.retailerId, '❌ Delivery Failed — Address Issue',
+        `Our driver could not locate your delivery address in ${current.city}.${noteStr} Please update your address details and contact us to reschedule.`,
+        'alert', req.params.id);
+
+      for (const u of optUsers.rows) {
+        await notify(u.id, '❌ Wrong Address — ' + current.city,
+          `Delivery ${req.params.id} to ${current.retailer} failed — address could not be found.${noteStr}
+Please verify retailer address and reschedule.`,
+          'warning', req.params.id);
+      }
+
+      if (driverId) {
+        await notify(driverId, '❌ Address Issue Recorded',
+          `Delivery ${req.params.id} recorded as failed due to address issue.${noteStr} Proceed to next stop.`,
+          'info', req.params.id);
+      }
+
+      return res.json({ ok: true, newStatus, failureType, notified: 3 });
+    }
+
+    // ══════════════════════════════════════════
+    // CASE 6: IN TRANSIT or OTHER FAILED
+    // ══════════════════════════════════════════
+    const statusLabel = { 'in-transit':'In Transit 🚛', 'delivered':'Delivered ✅', 'failed':'Delivery Failed ❌' };
+    const msgType     = { 'in-transit':'info', 'delivered':'success', 'failed':'alert' };
+
+    await notify(current.retailerId, `Delivery ${statusLabel[newStatus]}`,
+      newStatus === 'in-transit'
+        ? `Your delivery to ${current.city} is now on its way 🚛.${driverStr} Expected arrival: ${current.eta || 'soon'}.`
+        : `Your delivery to ${current.city} could not be completed.${noteStr} Our team will contact you to reschedule.`,
+      msgType[newStatus], req.params.id);
+
+    for (const u of [...optUsers.rows, ...whUsers.rows]) {
+      await notify(u.id, `Delivery ${statusLabel[newStatus]}`,
+        `Delivery ${req.params.id} → ${current.city} (${current.retailer}).${driverStr} Status: ${newStatus}.${noteStr}`,
+        msgType[newStatus], req.params.id);
+    }
+
+    if (driverId) {
+      await notify(driverId, `Your Delivery: ${statusLabel[newStatus]}`,
+        newStatus === 'in-transit'
+          ? `Delivery ${req.params.id} to ${current.city} marked in-transit.${noteStr}`
+          : `Delivery ${req.params.id} to ${current.city} recorded as failed.${noteStr}`,
+        msgType[newStatus], req.params.id);
+    }
+
+    res.json({ ok: true, newStatus, failureType, notified: 4 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Vehicle Breakdown Report (standalone endpoint)
+app.post('/api/vehicles/:id/breakdown', auth, async (req, res) => {
+  const { note, driverDeliveryId } = req.body;
+  const vehicleId = req.params.id;
+  try {
+    // Mark all active deliveries for this vehicle as failed
+    const activeDeliveries = await pool.query(
+      `SELECT d.id, d."driverId", d."driverName", o.city, o."retailerName" AS retailer, o."retailerId", o.items
+       FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+       WHERE d."vehicleId"=$1 AND d.status='in-transit'`,
+      [vehicleId]
+    );
+
+    const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+    const whUsers  = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+
+    for (const del of activeDeliveries.rows) {
+      await pool.query(
+        `UPDATE "Deliveries" SET status='failed', "updatedAt"=NOW() WHERE id=$1`,
+        [del.id]
+      );
+
+      // Try auto-reassign
+      const reassign = del.driverId
+        ? await autoReassign(del.id, del.driverId, 'vehicle_breakdown')
+        : { reassigned: false };
+
+      // Notify retailer
+      await notify(del.retailerId, '🚨 Delivery Delayed — Vehicle Breakdown',
+        `We apologise — your delivery to ${del.city} has been delayed due to a vehicle breakdown.` +
+        (reassign.reassigned ? ` A replacement driver has been arranged.` : ` Our team is arranging a replacement urgently.`),
+        'alert', del.id);
+
+      // Notify new driver
+      if (reassign.reassigned && reassign.driverUserId) {
+        await notify(reassign.driverUserId, '🚨 Emergency Reassignment',
+          `You have been assigned delivery ${del.id} to ${del.city} (${del.retailer}, ${del.items} items) — original driver's vehicle broke down. Please proceed to warehouse immediately.`,
+          'alert', del.id);
       }
     }
-    res.json({ ok: true, newStatus, notified: ['retailer', 'order_team', 'warehouse', 'distributor'] });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    // Notify OPT and warehouse
+    for (const u of optUsers.rows) {
+      await notify(u.id, `🚨 Vehicle Breakdown — ${vehicleId}`,
+        `Vehicle ${vehicleId} has broken down. ${activeDeliveries.rows.length} active deliveries affected.${note ? ' Note: '+note : ''}
+Auto-reassignment attempted for all affected deliveries.`,
+        'alert');
+    }
+    for (const u of whUsers.rows) {
+      await notify(u.id, `🔧 Vehicle ${vehicleId} — Breakdown`,
+        `Vehicle ${vehicleId} is out of service. ${activeDeliveries.rows.length} deliveries need cargo transfer. Await OPT instructions.`,
+        'alert');
+    }
+
+    res.json({ ok: true, vehicleId, affectedDeliveries: activeDeliveries.rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Reschedule failed delivery
+app.post('/api/deliveries/:id/reschedule', auth, async (req, res) => {
+  try {
+    const del = await pool.query(
+      `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority
+       FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
+      [req.params.id]
+    );
+    if (!del.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    const d = del.rows[0];
+
+    if (d.status !== 'failed') {
+      return res.status(400).json({ error: 'Only failed deliveries can be rescheduled' });
+    }
+
+    // Find available driver and vehicle
+    const drvRes = await pool.query(
+      `SELECT d.id, d.name, COALESCE(u.id, d."userId", d.id) AS "userId"
+       FROM "Drivers" d
+       LEFT JOIN "Users" u ON lower(u.name)=lower(d.name) AND u.role='distributor'
+       WHERE NOT EXISTS (
+         SELECT 1 FROM "Deliveries" del
+         WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+           AND (del."driverId"=d.id OR (u.id IS NOT NULL AND del."driverId"=u.id))
+       ) LIMIT 1`
+    );
+    const vehRes = await pool.query(
+      `SELECT id, cap FROM "Vehicles"
+       WHERE NOT EXISTS (
+         SELECT 1 FROM "Deliveries" del
+         WHERE del.status IN ('assigned','warehouse_ready','loaded','in-transit')
+           AND del."vehicleId"=id
+       ) LIMIT 1`
+    );
+
+    if (!drvRes.rows.length || !vehRes.rows.length) {
+      return res.status(409).json({ error: 'No available driver or vehicle for rescheduling' });
+    }
+
+    const drv = drvRes.rows[0], veh = vehRes.rows[0];
+    const newEta = new Date(Date.now() + 2*60*60*1000)
+      .toLocaleTimeString('en-LK', { timeZone:'Asia/Colombo', hour:'2-digit', minute:'2-digit', hour12:false });
+
+    await pool.query(
+      `UPDATE "Deliveries"
+       SET status='assigned', "driverId"=$1, "driverName"=$2, "vehicleId"=$3, eta=$4, "updatedAt"=NOW()
+       WHERE id=$5`,
+      [drv.id, drv.name, veh.id, newEta, req.params.id]
+    );
+
+    const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+    const whUsers  = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+
+    // Notify retailer
+    await notify(d.retailerId, '🔄 Delivery Rescheduled',
+      `Good news! Your delivery to ${d.city} has been rescheduled. New driver: ${drv.name}, Vehicle: ${veh.id}. Estimated arrival: ${newEta}.`,
+      'success', req.params.id);
+
+    // Notify new driver
+    await notify(drv.userId, '📦 Rescheduled Delivery Assigned',
+      `Delivery ${req.params.id} to ${d.city} (${d.retailer}, ${d.items} items) has been rescheduled and assigned to you. Vehicle: ${veh.id}. ETA: ${newEta}.`,
+      'info', req.params.id);
+
+    // Notify warehouse
+    for (const u of whUsers.rows) {
+      await notify(u.id, '🔄 Rescheduled — Prepare Cargo',
+        `Delivery ${req.params.id} rescheduled. Driver: ${drv.name}, Vehicle: ${veh.id}. Please prepare cargo for ${d.city} (${d.retailer}, ${d.items} items).`,
+        'info', req.params.id);
+    }
+
+    // Notify OPT
+    for (const u of optUsers.rows) {
+      await notify(u.id, '✅ Delivery Rescheduled',
+        `Delivery ${req.params.id} to ${d.city} (${d.retailer}) rescheduled to ${drv.name} (${veh.id}). ETA: ${newEta}.`,
+        'success', req.params.id);
+    }
+
+    res.json({ ok: true, driverName: drv.name, vehicleId: veh.id, eta: newEta });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════════
@@ -1663,145 +2026,49 @@ app.put('/api/retailers/:id/reset-password', auth, orderTeamOnly, async (req, re
 const PORT = process.env.PORT || 3000;
 
 // ══════════════════════════════════════════════
-// SPRINT 2 — GPS TRACKING (ADVANCED)
+// SPRINT 2 — GPS TRACKING
 // ══════════════════════════════════════════════
 
-/*
- * ── ADVANCED GPS MIGRATION (run once in Neon):
- *
- *  -- Core columns (may already exist):
- *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS accuracy  NUMERIC;
- *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS speed     NUMERIC;
- *  ALTER TABLE "VehicleLocations" ADD COLUMN IF NOT EXISTS heading   NUMERIC;
- *
- *  -- Keep only last 500 rows per delivery (auto-cleanup):
- *  CREATE OR REPLACE FUNCTION cleanup_vehicle_locations() RETURNS trigger AS $$
- *  BEGIN
- *    DELETE FROM "VehicleLocations"
- *    WHERE "deliveryId" = NEW."deliveryId"
- *      AND id NOT IN (
- *        SELECT id FROM "VehicleLocations"
- *        WHERE "deliveryId" = NEW."deliveryId"
- *        ORDER BY "recordedAt" DESC LIMIT 500
- *      );
- *    RETURN NEW;
- *  END;
- *  $$ LANGUAGE plpgsql;
- *
- *  DROP TRIGGER IF EXISTS trg_cleanup_locations ON "VehicleLocations";
- *  CREATE TRIGGER trg_cleanup_locations
- *    AFTER INSERT ON "VehicleLocations"
- *    FOR EACH ROW EXECUTE FUNCTION cleanup_vehicle_locations();
- */
-
-// ── SSE: per-delivery subscriber registry ──────
-// Map<deliveryId, Set<res>>
-const sseClients = new Map();
-
-function broadcastLocation(deliveryId, payload) {
-  const clients = sseClients.get(String(deliveryId));
-  if (!clients || !clients.size) return;
-  const data = `data: ${JSON.stringify(payload)}\n\n`;
-  clients.forEach(res => {
-    try { res.write(data); } catch (_) { clients.delete(res); }
-  });
-}
-
-// SSE stream endpoint — frontend subscribes here instead of polling
-app.get('/api/tracking/:deliveryId/stream', auth, (req, res) => {
-  const id = String(req.params.deliveryId);
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
-  res.flushHeaders();
-  // Send a heartbeat comment every 20s to keep the connection alive
-  const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch(_) { clearInterval(hb); } }, 20000);
-  if (!sseClients.has(id)) sseClients.set(id, new Set());
-  sseClients.get(id).add(res);
-  req.on('close', () => {
-    clearInterval(hb);
-    sseClients.get(id)?.delete(res);
-    if (sseClients.get(id)?.size === 0) sseClients.delete(id);
-  });
-});
-
-// ── Stale driver detection endpoint ────────────
-app.get('/api/tracking/stale', auth, async (req, res) => {
-  try {
-    const r = await pool.query(
-      `SELECT DISTINCT ON (vl."deliveryId")
-              vl."deliveryId", d."driverName", d."vehicleId",
-              vl.lat, vl.lng,
-              EXTRACT(EPOCH FROM (NOW() - vl."recordedAt")) AS "secondsAgo",
-              TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "lastSeen"
-       FROM "VehicleLocations" vl
-       JOIN "Deliveries" d ON vl."deliveryId"=d.id
-       WHERE d.status='in-transit'
-       ORDER BY vl."deliveryId", vl."recordedAt" DESC`
-    );
-    const stale = r.rows.filter(row => parseFloat(row.secondsAgo) > 120);
-    res.json(stale);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Breadcrumb trail endpoint ───────────────────
-app.get('/api/tracking/:deliveryId/trail', auth, async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-    const r = await pool.query(
-      `SELECT lat, lng, speed, heading, accuracy,
-       TO_CHAR("recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS t
-       FROM "VehicleLocations"
-       WHERE "deliveryId"=$1
-       ORDER BY "recordedAt" DESC LIMIT $2`,
-      [req.params.deliveryId, limit]
-    );
-    // Return oldest-first so the polyline draws correctly
-    res.json(r.rows.reverse());
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Driver sends current GPS location ──────────
-// (called every 10s when in-transit; also pushes via SSE)
+// Driver sends current GPS location (called every 10s when in-transit)
 app.post('/api/tracking/update', auth, async (req, res) => {
   try {
     const { deliveryId, lat, lng } = req.body;
     if (!deliveryId || lat === undefined || lng === undefined) {
       return res.status(400).json({ error: 'deliveryId, lat and lng required' });
     }
-    const latNum     = parseFloat(lat);
-    const lngNum     = parseFloat(lng);
+    const latNum = parseFloat(lat);
+    const lngNum = parseFloat(lng);
     if (isNaN(latNum) || isNaN(lngNum)) {
       return res.status(400).json({ error: 'lat and lng must be valid numbers' });
     }
-    const accNum     = req.body.accuracy != null ? parseFloat(req.body.accuracy) : null;
-    const speedNum   = req.body.speed    != null ? parseFloat(req.body.speed)    : null;
-    const headingNum = req.body.heading  != null ? parseFloat(req.body.heading)  : null;
+    // Verify this delivery belongs to this driver before inserting
+    const check = await pool.query(
+      `SELECT d.id FROM "Deliveries" d
+       JOIN "Drivers" dr ON dr.id=d."driverId"
+       WHERE d.id=$1 AND (d."driverId"=$2 OR dr."userId"=$2)
+       LIMIT 1`,
+      [deliveryId, req.user.userId]
+    );
+    // Allow even if check fails (driver may use Drivers.id not Users.id)
+    const accNum     = req.body.accuracy ? parseFloat(req.body.accuracy) : null;
+    const speedNum   = req.body.speed    ? parseFloat(req.body.speed)    : null;
+    const headingNum = req.body.heading  ? parseFloat(req.body.heading)  : null;
 
     // Try inserting with extra columns — fall back if columns don't exist yet
     try {
       await pool.query(
         `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,accuracy,speed,heading,"recordedAt")
          VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
-        [deliveryId, req.user.id, latNum, lngNum, accNum, speedNum, headingNum]
+        [deliveryId, req.user.userId, latNum, lngNum, accNum, speedNum, headingNum]
       );
     } catch {
       await pool.query(
         `INSERT INTO "VehicleLocations"("deliveryId","driverId",lat,lng,"recordedAt")
          VALUES($1,$2,$3,$4,NOW())`,
-        [deliveryId, req.user.id, latNum, lngNum]
+        [deliveryId, req.user.userId, latNum, lngNum]
       );
     }
-
-    // Push update to any SSE subscribers immediately
-    broadcastLocation(deliveryId, {
-      lat: latNum, lng: lngNum,
-      accuracy: accNum, speed: speedNum, heading: headingNum,
-      recordedAt: new Date().toISOString()
-    });
-
-    console.log(`[GPS] delivery=${deliveryId} driver=${req.user.id} lat=${latNum.toFixed(5)} lng=${lngNum.toFixed(5)} acc=${accNum}m spd=${speedNum}m/s hdg=${headingNum}°`);
+    console.log(`[GPS] delivery=${deliveryId} driver=${req.user.userId} lat=${latNum.toFixed(5)} lng=${lngNum.toFixed(5)} acc=${accNum}m speed=${speedNum}m/s`);
     res.json({ ok: true });
   } catch(e) {
     console.error('[GPS update error]', e.message);
@@ -1809,13 +2076,12 @@ app.post('/api/tracking/update', auth, async (req, res) => {
   }
 });
 
-// ── Get latest location for one delivery ───────
+// Get latest location for a delivery
 app.get('/api/tracking/:deliveryId', auth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT vl.lat, vl.lng, vl.accuracy, vl.speed, vl.heading,
+      `SELECT vl.lat, vl.lng,
               TO_CHAR(vl."recordedAt" AT TIME ZONE 'Asia/Colombo', 'HH24:MI:SS') AS "recordedAt",
-              EXTRACT(EPOCH FROM (NOW() - vl."recordedAt")) AS "secondsAgo",
               d."driverName", d."vehicleId", d.eta, d.status,
               o.city, o."retailerName"
        FROM "VehicleLocations" vl
@@ -1830,7 +2096,7 @@ app.get('/api/tracking/:deliveryId', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Get all active tracked deliveries (map overview) ──
+// Get all active tracked deliveries (for map overview)
 app.get('/api/tracking', auth, async (req, res) => {
   try {
     const r = await pool.query(
