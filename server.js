@@ -2176,7 +2176,7 @@ app.get('/api/tracking', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Stock Restocked Notification (call when warehouse updates stock)
+
 // ── Stock Restocked Notification (call when warehouse updates stock)
 app.put('/api/stock/:id/update', auth, async (req, res) => {
   const { availableUnits, availableKg } = req.body;
@@ -2234,6 +2234,8 @@ app.put('/api/stock/:id/update', auth, async (req, res) => {
   }
 });
 
+
+
 // ── Get all stock levels (for warehouse stock management page)
 app.get('/api/stock', auth, async (req, res) => {
   try {
@@ -2249,20 +2251,6 @@ app.get('/api/stock', auth, async (req, res) => {
     );
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Get all stock levels (for warehouse stock management page)
-app.get('/api/stock', auth, async (req, res) => {
-  try {
-    // ✅ FIXED
-    const r = await pool.query(
-      `SELECT s.id, s."productName", s."availableUnits", s."availableKg", s."weightPerUnit",
-   (SELECT COUNT(*) FROM "Orders" WHERE "productId"=s.id AND status='rejected'
-    AND "rejectCategory"='out_of_stock' AND "stockWatchActive"=true) AS "watchCount"
-   FROM "Stock" s ORDER BY s."productName"`
-    );
-    res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════════
