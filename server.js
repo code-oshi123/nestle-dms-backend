@@ -2196,16 +2196,17 @@ app.put('/api/stock/:id/update', auth, async (req, res) => {
     // Check for orders that were rejected for out_of_stock and are watching this product
     let watchedOrders = [];
     try {
+      // ✅ FIXED — explicit cast, proper JOIN
       watchedOrders = (await pool.query(
         `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items, o.kg,
-                o.priority, o.product, s."productName"
-         FROM "Orders" o
-         JOIN "Stock" s ON s.id=$1
-         WHERE o."productId"=$1
-           AND o.status='rejected'
-           AND o."rejectCategory"='out_of_stock'
-           AND o."stockWatchActive"=true
-           AND o.items <= $2`,
+          o.priority, o.product, s."productName"
+   FROM "Orders" o
+   JOIN "Stock" s ON s.id = o."productId"
+   WHERE o."productId" = $1::integer
+     AND o.status = 'rejected'
+     AND o."rejectCategory" = 'out_of_stock'
+     AND o."stockWatchActive" = true
+     AND o.items <= $2`,
         [productId, availableUnits]
       )).rows;
     } catch (e) { console.warn('[stock-watch query]', e.message); }
