@@ -295,10 +295,10 @@ app.get('/api/orders', auth, async (req, res) => {
     if (role === 'retailer') {
       r = await pool.query(
         `SELECT o.id, o.city, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason", COALESCE(o."rejectCategory",'other') AS "rejectCategory",
+         COALESCE(d."deliveryPin",'') AS "deliveryPin", COALESCE(d."pinVerified",false) AS "pinVerified",
          TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
          d.id AS "deliveryId", d.status AS "deliveryStatus",
-         d."receiptConfirmed", d."deliveryPin", d."pinConfirmed",
-         TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
+         d."receiptConfirmed", TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
          d."driverName", d."vehicleId"
          FROM "Orders" o
          LEFT JOIN "Deliveries" d ON d."orderId" = o.id
@@ -501,21 +501,41 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             }
           }
 
-          // 2. Create delivery record with PIN and mark order as consolidated
+          // 2. Generate 4-digit delivery PIN
           const deliveryPin = String(Math.floor(1000 + Math.random() * 9000));
-          const newDelRow = await pool.query(
-            `INSERT INTO "Deliveries"("orderId",status,"deliveryPin","createdAt") VALUES($1,'pending',$2,NOW()) RETURNING id`,
-            [o.id, deliveryPin]
-          );
-          await pool.query(`UPDATE "Orders" SET status='consolidated' WHERE id=$1`, [o.id]);
 
-          // Send PIN to retailer immediately
+          // 3. Create delivery record with PIN
+          try {
+            await pool.query(
+              `INSERT INTO "Deliveries"("orderId",status,"deliveryPin","createdAt") VALUES($1,'pending',$2,NOW())`,
+              [o.id, deliveryPin]
+            );
+          } catch {
+            // Add PIN columns if they don't exist yet
+            await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "deliveryPin"   VARCHAR(4)`);
+            await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "pinVerified"   BOOLEAN DEFAULT false`);
+            await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "pinVerifiedAt" TIMESTAMPTZ`);
+            await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "pinAttempts"   INTEGER DEFAULT 0`);
+            await pool.query(
+              `INSERT INTO "Deliveries"("orderId",status,"deliveryPin","createdAt") VALUES($1,'pending',$2,NOW())`,
+              [o.id, deliveryPin]
+            );
+          }
+          await pool.query(`UPDATE "Orders" SET status='consolidated' WHERE id=$1`, [o.id]);
+          console.log(`[PIN] Generated ${deliveryPin} for order ${o.id} retailer ${o.retailerId}`);
+
+          // 4. Notify retailer with PIN prominently
           await notify(
             o.retailerId,
-            '🔐 Your Delivery PIN — Keep This Safe',
-            `Your order ${o.id} to ${o.city} has been confirmed!\n\nYour delivery PIN is:\n\n🔢 ${deliveryPin}\n\nGive this 4-digit PIN to the driver when they arrive to confirm delivery. Do not share it with anyone else.`,
-            'success',
-            o.id
+            `✅ Order Confirmed — Your Delivery PIN: ${deliveryPin}`,
+            `Your order ${o.id} to ${o.city} (${orderKg.toFixed(1)}kg) is confirmed and queued.
+
+🔐 YOUR DELIVERY PIN: ${deliveryPin}
+
+When your driver arrives, they will ask for this 4-digit PIN to verify your identity before handing over the goods.
+
+⚠️ Do NOT share this PIN with anyone other than your delivery driver.`,
+            'success', o.id
           );
 
           // 4. Count unassigned pending deliveries
@@ -2182,86 +2202,63 @@ app.get('/api/tracking', auth, async (req, res) => {
 // ── Stock Restocked Notification (call when warehouse updates stock)
 app.put('/api/stock/:id/update', auth, async (req, res) => {
   const { availableUnits, availableKg } = req.body;
-  const productId = parseInt(req.params.id, 10);
-
-  if (isNaN(productId)) {
-    return res.status(400).json({ error: 'Invalid product ID' });
-  }
-
+  const productId = req.params.id;
   try {
-    // Step 1: Update stock — recalculate kg server-side using weightPerUnit
+    // Update stock levels
     await pool.query(
-      `UPDATE "Stock"
-       SET "availableUnits" = $1,
-           "availableKg" = CASE
-             WHEN "weightPerUnit" IS NOT NULL AND "weightPerUnit" > 0
-             THEN $1::numeric * "weightPerUnit"
-             ELSE $2::numeric
-           END
-       WHERE id = $3`,
-      [availableUnits, availableKg ?? 0, productId]
+      `UPDATE "Stock" SET "availableUnits"=$1, "availableKg"=$2 WHERE id=$3`,
+      [availableUnits, availableKg, productId]
     );
 
-    // Step 2: Find watching orders — two separate queries to avoid $1 type conflict
+    // Check for orders that were rejected for out_of_stock and are watching this product
     let watchedOrders = [];
     try {
-      const stockRow = await pool.query(
-        `SELECT "productName" FROM "Stock" WHERE id = $1`,
-        [productId]
-      );
-      const productName = stockRow.rows[0]?.productName || null;
-
-      const ordersRes = await pool.query(
-        `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items,
-                o.kg, o.priority
+      watchedOrders = (await pool.query(
+        `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items, o.kg,
+                o.priority, o.product, s."productName"
          FROM "Orders" o
-         WHERE o."productId"::integer = $1
-           AND o.status = 'rejected'
-           AND o."rejectCategory" = 'out_of_stock'
-           AND o."stockWatchActive" = true
-           AND o.items::integer <= $2`,
-        [productId, parseInt(availableUnits, 10)]
-      );
+         JOIN "Stock" s ON s.id=$1
+         WHERE o."productId"=$1
+           AND o.status='rejected'
+           AND o."rejectCategory"='out_of_stock'
+           AND o."stockWatchActive"=true
+           AND o.items <= $2`,
+        [productId, availableUnits]
+      )).rows;
+    } catch(e) { console.warn('[stock-watch query]', e.message); }
 
-      watchedOrders = ordersRes.rows.map(o => ({ ...o, productName }));
-    } catch(e) {
-      console.warn('[stock-watch query]', e.message);
-    }
-
-    // Step 3: Notify watching retailers
+    // Notify each watching retailer
     for (const o of watchedOrders) {
       await notify(
         o.retailerId,
         '🟢 Stock Restocked — Resubmit Your Order',
-        `Good news! ${o.productName||'The product'} you ordered is back in stock.\n\nYour previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.\n\nTap "Resubmit" on your rejected order to pre-fill the form automatically.`,
+        `Good news! ${o.productName||'The product'} you ordered is back in stock.
+
+Your previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.
+
+Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
         'success',
         o.id
       );
+      // Clear the watch flag
       try {
         await pool.query(`UPDATE "Orders" SET "stockWatchActive"=false WHERE id=$1`, [o.id]);
-      } catch(e) { console.warn('[stock-watch clear]', e.message); }
-      console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id}`);
+      } catch {}
+      console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id} — stock restored`);
     }
 
     res.json({ ok: true, restockedCount: watchedOrders.length });
-  } catch(e) {
-    console.error('[stock update error]', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Get all stock levels (for warehouse stock management page)
 app.get('/api/stock', auth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT s.id, s."productName", s."availableUnits", s."availableKg", s."weightPerUnit",
-       (SELECT COUNT(*) FROM "Orders" o2
-        WHERE o2."productId" = s.id
-          AND o2.status = 'rejected'
-          AND o2."rejectCategory" = 'out_of_stock'
-          AND o2."stockWatchActive" = true) AS "watchCount"
-       FROM "Stock" s
-       ORDER BY s."productName"`
+      `SELECT id, "productName", "availableUnits", "availableKg", "weightPerUnit",
+       (SELECT COUNT(*) FROM "Orders" WHERE "productId"=s.id AND status='rejected'
+        AND "rejectCategory"='out_of_stock' AND "stockWatchActive"=true) AS "watchCount"
+       FROM "Stock" ORDER BY "productName"`
     );
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -2330,104 +2327,91 @@ app.post('/api/ai/chat', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// PIN-BASED DELIVERY CONFIRMATION
+// PIN PROOF OF DELIVERY
 // ══════════════════════════════════════════════
 
-// ── Driver submits PIN to confirm delivery delivered
-app.put('/api/deliveries/:id/confirm-pin', auth, async (req, res) => {
+// Driver verifies retailer PIN → auto-marks delivered
+app.post('/api/deliveries/:id/verify-pin', auth, async (req, res) => {
   const { pin } = req.body;
-  if (!pin) return res.status(400).json({ error: 'PIN is required' });
-
-  try {
-    const del = await pool.query(
-      `SELECT d.*, o."retailerId", o."retailerName" AS retailer,
-              o.city, o.items, o.kg
-       FROM "Deliveries" d
-       JOIN "Orders" o ON d."orderId" = o.id
-       WHERE d.id = $1`,
-      [req.params.id]
-    );
-    if (!del.rows.length) return res.status(404).json({ error: 'Delivery not found' });
-    const d = del.rows[0];
-
-    if (d.pinConfirmed) {
-      return res.status(400).json({ error: 'Delivery already PIN-confirmed' });
-    }
-    if (!['loaded', 'in-transit'].includes(d.status)) {
-      return res.status(400).json({ error: 'Delivery must be in-transit or loaded to confirm via PIN' });
-    }
-    if (String(d.deliveryPin).trim() !== String(pin).trim()) {
-      return res.status(401).json({ error: '❌ Incorrect PIN — ask the retailer for the correct 4-digit code' });
-    }
-
-    // Mark delivered + pin confirmed
-    await pool.query(
-      `UPDATE "Deliveries"
-       SET status = 'delivered',
-           "pinConfirmed" = true,
-           "pinConfirmedAt" = NOW(),
-           "updatedAt" = NOW()
-       WHERE id = $1`,
-      [req.params.id]
-    );
-
-    // Notify retailer
-    await notify(
-      d.retailerId,
-      '✅ Delivery Confirmed by PIN',
-      `Your delivery to ${d.city} (${d.items} items) has been successfully confirmed using your PIN. Thank you!`,
-      'success', req.params.id
-    );
-
-    // Notify order team
-    const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
-    for (const u of optUsers.rows) {
-      await notify(u.id, '✅ PIN-Confirmed Delivery — ' + d.city,
-        `Delivery ${req.params.id} to ${d.retailer} (${d.city}) confirmed via PIN by driver.`,
-        'success', req.params.id);
-    }
-
-    // Notify warehouse
-    const whUsers = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
-    for (const u of whUsers.rows) {
-      await notify(u.id, '✅ Delivered — ' + d.city,
-        `Delivery ${req.params.id} to ${d.city} PIN-confirmed. Vehicle ${d.vehicleId} is free.`,
-        'success', req.params.id);
-    }
-
-    res.json({ ok: true, message: '✅ Delivery confirmed successfully!' });
-  } catch(e) {
-    console.error('[pin-confirm error]', e.message);
-    res.status(500).json({ error: e.message });
+  if (!pin || String(pin).trim().length !== 4) {
+    return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
   }
-});
-
-// ── Retailer views their PIN for an active delivery
-app.get('/api/deliveries/:id/pin', auth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT d."deliveryPin", d."pinConfirmed", d.status,
-              o."retailerId", o.city, o.items
-       FROM "Deliveries" d
-       JOIN "Orders" o ON d."orderId" = o.id
-       WHERE d.id = $1`,
+      `SELECT d.*, o."retailerId", o."retailerName" AS retailer, o.city, o.items, o.kg
+       FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1`,
       [req.params.id]
     );
-    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
-    const row = r.rows[0];
+    if (!r.rows.length) return res.status(404).json({ error: 'Delivery not found' });
+    const d = r.rows[0];
 
-    if (row.retailerId !== req.user.id && req.user.role !== 'order_team') {
-      return res.status(403).json({ error: 'Access denied' });
+    if (d.status === 'delivered') {
+      return res.status(409).json({ error: 'This delivery is already marked as delivered.' });
+    }
+    if (d.status !== 'in-transit') {
+      return res.status(400).json({ error: 'Delivery must be In Transit before PIN verification.' });
+    }
+    if (!d.deliveryPin) {
+      return res.status(400).json({ error: 'No PIN assigned to this delivery.' });
     }
 
-    res.json({
-      pin:       row.pinConfirmed ? '****' : row.deliveryPin,
-      confirmed: row.pinConfirmed,
-      status:    row.status,
-      city:      row.city,
-      items:     row.items
-    });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    // Track wrong attempts
+    const attempts = (parseInt(d.pinAttempts) || 0) + 1;
+    if (String(pin).trim() !== String(d.deliveryPin)) {
+      try { await pool.query(`UPDATE "Deliveries" SET "pinAttempts"=$1 WHERE id=$2`, [attempts, req.params.id]); } catch {}
+      const remaining = 3 - attempts;
+      if (remaining <= 0) {
+        const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+        for (const u of optUsers.rows) {
+          await notify(u.id, '🚨 PIN Verification Failed — Delivery ' + req.params.id,
+            `Driver ${d.driverName} failed PIN verification 3 times for delivery ${req.params.id} to ${d.retailer} (${d.city}). Please investigate.`,
+            'alert', req.params.id);
+        }
+        return res.status(403).json({ error: 'Too many incorrect attempts. OPT has been notified.', locked: true });
+      }
+      return res.status(401).json({ error: `Incorrect PIN. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`, remaining });
+    }
+
+    // ✅ PIN CORRECT — mark delivered
+    await pool.query(
+      `UPDATE "Deliveries" SET status='delivered', "pinVerified"=true, "pinVerifiedAt"=NOW(), "pinAttempts"=0, "updatedAt"=NOW() WHERE id=$1`,
+      [req.params.id]
+    );
+    console.log(`[PIN] ✅ Verified delivery ${req.params.id}`);
+
+    const driverId = d.driverId ? Number(d.driverId) : null;
+    const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+    const whUsers  = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+
+    await notify(d.retailerId, '✅ Delivery Verified — PIN Confirmed',
+      `Your delivery ${req.params.id} to ${d.city} was verified with your PIN and successfully completed 🔐✅.
+
+Items: ${d.items} · Driver: ${d.driverName || '—'}
+
+Please confirm receipt in the app to finalise.`,
+      'success', req.params.id);
+
+    if (driverId) {
+      await notify(driverId, '✅ PIN Verified — Move to Next Stop',
+        `PIN verified for delivery ${req.params.id} to ${d.retailer} (${d.city}). Delivery complete ✅. Check your route for remaining stops.`,
+        'success', req.params.id);
+    }
+    for (const u of optUsers.rows) {
+      await notify(u.id, `✅ PIN Verified — ${d.city}`,
+        `Delivery ${req.params.id} to ${d.retailer} (${d.city}) PIN-verified and marked delivered.`,
+        'success', req.params.id);
+    }
+    for (const u of whUsers.rows) {
+      await notify(u.id, `✅ Delivered & Verified — ${d.city}`,
+        `Delivery ${req.params.id} PIN-verified. Vehicle ${d.vehicleId} can proceed.`,
+        'success', req.params.id);
+    }
+
+    res.json({ ok: true, message: 'PIN verified — delivery complete' });
+  } catch(e) {
+    console.error('[PIN]', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`Nestlé DMS API running on port ${PORT}`));
