@@ -2177,53 +2177,73 @@ app.get('/api/tracking', auth, async (req, res) => {
 });
 
 
-// ── Stock Restocked Notification (call when warehouse updates stock)
 app.put('/api/stock/:id/update', auth, async (req, res) => {
   const { availableUnits, availableKg } = req.body;
-  const productId = parseInt(req.params.id);  // ← explicit integer parse
+  const productId = parseInt(req.params.id, 10);
+
+  if (isNaN(productId)) {
+    return res.status(400).json({ error: 'Invalid product ID' });
+  }
+
   try {
-    // Recalculate kg server-side using weightPerUnit if available
+    // Step 1: Update stock
     await pool.query(
       `UPDATE "Stock"
        SET "availableUnits" = $1,
            "availableKg" = CASE
              WHEN "weightPerUnit" IS NOT NULL AND "weightPerUnit" > 0
              THEN $1::numeric * "weightPerUnit"
-             ELSE $2
+             ELSE $2::numeric
            END
        WHERE id = $3`,
-      [availableUnits, availableKg, productId]
+      [availableUnits, availableKg ?? 0, productId]
     );
 
-    // Check for orders watching this product
+    // Step 2: Find watching orders — use two separate queries to avoid $1 type conflict
     let watchedOrders = [];
     try {
-      watchedOrders = (await pool.query(
+      // First get the product name separately
+      const stockRow = await pool.query(
+        `SELECT "productName" FROM "Stock" WHERE id = $1`,
+        [productId]
+      );
+      const productName = stockRow.rows[0]?.productName || null;
+
+      // Then find watching orders — no JOIN, no type ambiguity
+      const ordersRes = await pool.query(
         `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items,
-                o.kg, o.priority, o.product, s."productName"
+                o.kg, o.priority
          FROM "Orders" o
-         JOIN "Stock" s ON s.id = o."productId"
-         WHERE o."productId" = $1
+         WHERE o."productId"::integer = $1
            AND o.status = 'rejected'
            AND o."rejectCategory" = 'out_of_stock'
            AND o."stockWatchActive" = true
-           AND o.items <= $2`,
-        [productId, availableUnits]
-      )).rows;
-    } catch(e) { console.warn('[stock-watch query]', e.message); }
+           AND o.items::integer <= $2`,
+        [productId, parseInt(availableUnits, 10)]
+      );
 
-    // Notify each watching retailer
+      watchedOrders = ordersRes.rows.map(o => ({ ...o, productName }));
+    } catch(e) {
+      console.warn('[stock-watch query]', e.message);
+    }
+
+    // Step 3: Notify watching retailers
     for (const o of watchedOrders) {
       await notify(
         o.retailerId,
         '🟢 Stock Restocked — Resubmit Your Order',
-        `Good news! ${o.productName||'The product'} you ordered is back in stock.\n\nYour previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.\n\nTap "Resubmit" on your rejected order to pre-fill the form automatically.`,
+        `Good news! ${o.productName || 'The product'} you ordered is back in stock.\n\nYour previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.\n\nTap "Resubmit" on your rejected order to pre-fill the form automatically.`,
         'success',
         o.id
       );
       try {
-        await pool.query(`UPDATE "Orders" SET "stockWatchActive"=false WHERE id=$1`, [o.id]);
-      } catch {}
+        await pool.query(
+          `UPDATE "Orders" SET "stockWatchActive" = false WHERE id = $1`,
+          [o.id]
+        );
+      } catch(e) {
+        console.warn('[stock-watch clear]', e.message);
+      }
       console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id}`);
     }
 
