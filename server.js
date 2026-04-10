@@ -2181,11 +2181,17 @@ app.put('/api/stock/:id/update', auth, async (req, res) => {
   const { availableUnits, availableKg } = req.body;
   const productId = req.params.id;
   try {
-    // Update stock levels
-    await pool.query(
-      `UPDATE "Stock" SET "availableUnits"=$1, "availableKg"=$2 WHERE id=$3`,
-      [availableUnits, availableKg, productId]
-    );
+    
+    // ✅ Fix in server.js — recalculate kg server-side if weightPerUnit is available
+await pool.query(
+  `UPDATE "Stock" 
+   SET "availableUnits"=$1,
+       "availableKg"=CASE WHEN "weightPerUnit" IS NOT NULL AND "weightPerUnit" > 0 
+                          THEN $1::numeric * "weightPerUnit" 
+                          ELSE $2 END
+   WHERE id=$3`,
+  [availableUnits, availableKg, productId]
+);
 
     // Check for orders that were rejected for out_of_stock and are watching this product
     let watchedOrders = [];
