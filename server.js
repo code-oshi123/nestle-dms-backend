@@ -2177,62 +2177,78 @@ app.get('/api/tracking', auth, async (req, res) => {
 });
 
 // ── Stock Restocked Notification (call when warehouse updates stock)
+// ── Stock Restocked Notification (call when warehouse updates stock)
 app.put('/api/stock/:id/update', auth, async (req, res) => {
   const { availableUnits, availableKg } = req.body;
-  const productId = req.params.id;
+  const productId = parseInt(req.params.id);  // ← explicit integer parse
   try {
-
-    // ✅ Fix in server.js — recalculate kg server-side if weightPerUnit is available
+    // Recalculate kg server-side using weightPerUnit if available
     await pool.query(
-      `UPDATE "Stock" 
-   SET "availableUnits"=$1,
-       "availableKg"=CASE WHEN "weightPerUnit" IS NOT NULL AND "weightPerUnit" > 0 
-                          THEN $1::numeric * "weightPerUnit" 
-                          ELSE $2 END
-   WHERE id=$3`,
+      `UPDATE "Stock"
+       SET "availableUnits" = $1,
+           "availableKg" = CASE
+             WHEN "weightPerUnit" IS NOT NULL AND "weightPerUnit" > 0
+             THEN $1::numeric * "weightPerUnit"
+             ELSE $2
+           END
+       WHERE id = $3`,
       [availableUnits, availableKg, productId]
     );
 
-    // Check for orders that were rejected for out_of_stock and are watching this product
+    // Check for orders watching this product
     let watchedOrders = [];
     try {
-      // ✅ FIXED — explicit cast, proper JOIN
       watchedOrders = (await pool.query(
-        `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items, o.kg,
-          o.priority, o.product, s."productName"
-   FROM "Orders" o
-   JOIN "Stock" s ON s.id = o."productId"
-   WHERE o."productId" = $1::integer
-     AND o.status = 'rejected'
-     AND o."rejectCategory" = 'out_of_stock'
-     AND o."stockWatchActive" = true
-     AND o.items <= $2`,
+        `SELECT o.id, o."retailerId", o."retailerName", o.city, o.items,
+                o.kg, o.priority, o.product, s."productName"
+         FROM "Orders" o
+         JOIN "Stock" s ON s.id = o."productId"
+         WHERE o."productId" = $1
+           AND o.status = 'rejected'
+           AND o."rejectCategory" = 'out_of_stock'
+           AND o."stockWatchActive" = true
+           AND o.items <= $2`,
         [productId, availableUnits]
       )).rows;
-    } catch (e) { console.warn('[stock-watch query]', e.message); }
+    } catch(e) { console.warn('[stock-watch query]', e.message); }
 
     // Notify each watching retailer
     for (const o of watchedOrders) {
       await notify(
         o.retailerId,
         '🟢 Stock Restocked — Resubmit Your Order',
-        `Good news! ${o.productName || 'The product'} you ordered is back in stock.
-
-Your previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.
-
-Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
+        `Good news! ${o.productName||'The product'} you ordered is back in stock.\n\nYour previous order ${o.id} to ${o.city} (${o.items} items) was rejected due to stock shortage — you can now resubmit it.\n\nTap "Resubmit" on your rejected order to pre-fill the form automatically.`,
         'success',
         o.id
       );
-      // Clear the watch flag
       try {
         await pool.query(`UPDATE "Orders" SET "stockWatchActive"=false WHERE id=$1`, [o.id]);
-      } catch { }
-      console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id} — stock restored`);
+      } catch {}
+      console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id}`);
     }
 
     res.json({ ok: true, restockedCount: watchedOrders.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch(e) {
+    console.error('[stock update error]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Get all stock levels (for warehouse stock management page)
+app.get('/api/stock', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT s.id, s."productName", s."availableUnits", s."availableKg", s."weightPerUnit",
+       (SELECT COUNT(*) FROM "Orders" o2
+        WHERE o2."productId" = s.id
+          AND o2.status = 'rejected'
+          AND o2."rejectCategory" = 'out_of_stock'
+          AND o2."stockWatchActive" = true) AS "watchCount"
+       FROM "Stock" s
+       ORDER BY s."productName"`
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Get all stock levels (for warehouse stock management page)
