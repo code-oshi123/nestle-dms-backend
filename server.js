@@ -2255,10 +2255,10 @@ Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
 app.get('/api/stock', auth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT id, "productName", "availableUnits", "availableKg", "weightPerUnit",
-       (SELECT COUNT(*) FROM "Orders" WHERE "productId"=s.id AND status='rejected'
-        AND "rejectCategory"='out_of_stock' AND "stockWatchActive"=true) AS "watchCount"
-       FROM "Stock" ORDER BY "productName"`
+      `SELECT s.id, s."productName", s."availableUnits", s."availableKg", s."weightPerUnit",
+       (SELECT COUNT(*) FROM "Orders" o WHERE o."productId"=s.id AND o.status='rejected'
+        AND o."rejectCategory"='out_of_stock' AND o."stockWatchActive"=true) AS "watchCount"
+       FROM "Stock" s ORDER BY s."productName"`
     );
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
