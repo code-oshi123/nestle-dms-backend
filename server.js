@@ -18,6 +18,31 @@ const { Pool } = require('pg');
  *  ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMPTZ;
  *
  *  The API will fall back gracefully if these columns don't exist yet.
+ *
+ *  -- Sales Rep: area field on Orders (run once):
+ *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "area" VARCHAR(20);
+ *
+ *  -- Sample sales_rep user (run once):
+ *  -- INSERT INTO "Users"(name, "Email", "PasswordHash", role, avatar)
+ *  -- VALUES('Sales Rep', 'salesrep@nestle.lk', '<bcrypt hash>', 'sales_rep', 'SR');
+ *
+ * ── SMART ORDER / STOCK MANAGEMENT MIGRATION (run once in Neon):
+ *
+ *  CREATE TABLE IF NOT EXISTS "WaitingList" (
+ *    id             SERIAL PRIMARY KEY,
+ *    "retailerId"   INTEGER NOT NULL,
+ *    "retailerName" VARCHAR(100) NOT NULL,
+ *    "productId"    INTEGER NOT NULL,
+ *    "productName"  VARCHAR(200),
+ *    "requestedQty" INTEGER NOT NULL,
+ *    status         VARCHAR(20) DEFAULT 'waiting',
+ *    "createdAt"    TIMESTAMPTZ DEFAULT NOW()
+ *  );
+ *
+ *  ALTER TABLE "Stock" ADD COLUMN IF NOT EXISTS "lowStockThreshold" INTEGER DEFAULT 50;
+ *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "isPartial"        BOOLEAN DEFAULT false;
+ *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "originalQty"      INTEGER;
+ *  ALTER TABLE "Users"  ADD COLUMN IF NOT EXISTS "orderFrequency"   VARCHAR(10) DEFAULT 'weekly';
  */
 
 const app = express();
@@ -294,7 +319,7 @@ app.get('/api/orders', auth, async (req, res) => {
     let r;
     if (role === 'retailer') {
       r = await pool.query(
-        `SELECT o.id, o.city, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason", COALESCE(o."rejectCategory",'other') AS "rejectCategory",
+        `SELECT o.id, o.city, o.area, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason", COALESCE(o."rejectCategory",'other') AS "rejectCategory",
          COALESCE(d."deliveryPin",'') AS "deliveryPin", COALESCE(d."pinVerified",false) AS "pinVerified",
          TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
          d.id AS "deliveryId", d.status AS "deliveryStatus",
@@ -307,7 +332,7 @@ app.get('/api/orders', auth, async (req, res) => {
       );
     } else {
       r = await pool.query(
-        `SELECT id, "retailerName" AS retailer, city, items, kg,
+        `SELECT id, "retailerName" AS retailer, city, area, items, kg,
          priority AS prio, status, "confirmedBy", "rejectReason", COALESCE("rejectCategory",'other') AS "rejectCategory",
          TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created
          FROM "Orders" ORDER BY "createdAt" DESC`
@@ -322,13 +347,16 @@ app.post('/api/orders', auth, async (req, res) => {
     retailerId,
     retailerName,
     city,
+    area,
     items,
     kg,
     priority,
     notes,
     productId,
     productName,
-    specifics
+    specifics,
+    isPartial,
+    originalQty
   } = req.body;
 
   // ── FIX: Validate inputs strictly ──
@@ -338,6 +366,9 @@ app.post('/api/orders', auth, async (req, res) => {
 
   if (!city || city.trim() === '') {
     return res.status(400).json({ error: 'City is required' });
+  }
+  if (!area || area.trim() === '') {
+    return res.status(400).json({ error: 'Area is required' });
   }
   if (!Number.isInteger(itemsNum) || itemsNum <= 0) {
     return res.status(400).json({ error: 'Items must be a positive whole number (no decimals or negatives)' });
@@ -370,12 +401,68 @@ app.post('/api/orders', auth, async (req, res) => {
   }
 
   try {
-    const r = await pool.query(
-      `INSERT INTO "Orders"("retailerId","retailerName",city,items,kg,priority,notes,"productId",status,"createdAt")
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,'pending',NOW()) RETURNING id`,
-      [retailerId, retailerName, city, itemsNum, kgNum, priority, notes||'', productIdNum]
-    );
-    const orderId = r.rows[0].id;
+    // Try INSERT with isPartial/originalQty columns; fall back if they don't exist yet
+    let orderId;
+    try {
+      const r = await pool.query(
+        `INSERT INTO "Orders"("retailerId","retailerName",city,area,items,kg,priority,notes,"productId",status,"isPartial","originalQty","createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11,NOW()) RETURNING id`,
+        [retailerId, retailerName, city, area.trim(), itemsNum, kgNum, priority, notes||'', productIdNum,
+         isPartial === true, originalQty ? Number(originalQty) : null]
+      );
+      orderId = r.rows[0].id;
+    } catch {
+      const r = await pool.query(
+        `INSERT INTO "Orders"("retailerId","retailerName",city,area,items,kg,priority,notes,"productId",status,"createdAt")
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',NOW()) RETURNING id`,
+        [retailerId, retailerName, city, area.trim(), itemsNum, kgNum, priority, notes||'', productIdNum]
+      );
+      orderId = r.rows[0].id;
+    }
+
+    // ── Deduct stock immediately on placement ──
+    // Calculate kg from weightPerUnit if retailer didn't supply it
+    let deductKg = kgNum;
+    if (deductKg === 0) {
+      try {
+        const wt = await pool.query(`SELECT "weightPerUnit" FROM "Stock" WHERE id=$1`, [productIdNum]);
+        if (wt.rows.length && wt.rows[0].weightPerUnit) {
+          deductKg = parseFloat(wt.rows[0].weightPerUnit) * itemsNum;
+          await pool.query(`UPDATE "Orders" SET kg=$1 WHERE id=$2`, [deductKg, orderId]);
+        }
+      } catch(e) { console.warn('[stock-deduct kg calc]', e.message); }
+    }
+    try {
+      await pool.query(
+        `UPDATE "Stock"
+         SET "availableUnits" = GREATEST(0, "availableUnits" - $1),
+             "availableKg"    = GREATEST(0, "availableKg"    - $2)
+         WHERE id = $3`,
+        [itemsNum, deductKg, productIdNum]
+      );
+
+      // Low stock alert to warehouse after deduction
+      const stockNow = await pool.query(
+        `SELECT "productName", "availableUnits",
+                COALESCE("lowStockThreshold", 50) AS "lowStockThreshold"
+         FROM "Stock" WHERE id=$1`,
+        [productIdNum]
+      );
+      if (stockNow.rows.length) {
+        const s = stockNow.rows[0];
+        if (parseInt(s.availableUnits) <= parseInt(s.lowStockThreshold)) {
+          const whUsers = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+          for (const u of whUsers.rows) {
+            await notify(
+              u.id,
+              `⚠️ Low Stock Alert — ${s.productName}`,
+              `Stock for ${s.productName} is running low after a new order.\nOnly ${s.availableUnits} units remaining (threshold: ${s.lowStockThreshold}).\nPlease restock soon.`,
+              'warning'
+            );
+          }
+        }
+      }
+    } catch(e) { console.warn('[stock-deduct]', e.message); }
 
     // Notify all Order Processing Team members
     const staff = await pool.query('SELECT id FROM "Users" WHERE role=\'order_team\'');
@@ -383,12 +470,46 @@ app.post('/api/orders', auth, async (req, res) => {
       await notify(
         s.id,
         'New Order Request 📋',
-        `${retailerName} requested ${itemsNum} items (${kgNum}kg) of ${productLabel} to ${city} — Priority: ${priority}`,
+        `${retailerName} requested ${itemsNum} items (${deductKg > 0 ? deductKg.toFixed(1) : kgNum}kg) of ${productLabel} to ${city} — ${area.trim()} — Priority: ${priority}${isPartial ? ' [PARTIAL ORDER]' : ''}`,
         'info',
         orderId
       );
     }
     res.json({ id: orderId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// SALES REP
+// ══════════════════════════════════════════════
+app.get('/api/sales-rep/dashboard', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT
+         COUNT(*)                                          AS "totalOrders",
+         COUNT(*) FILTER (WHERE status='pending')         AS "pendingOrders",
+         COUNT(*) FILTER (WHERE status='confirmed')       AS "confirmedOrders",
+         COUNT(*) FILTER (WHERE status='delivered')       AS "deliveredOrders",
+         COUNT(*) FILTER (WHERE status='rejected')        AS "rejectedOrders"
+       FROM "Orders"`
+    );
+    const row = r.rows[0];
+    res.json({
+      totalOrders:     Number(row.totalOrders),
+      pendingOrders:   Number(row.pendingOrders),
+      confirmedOrders: Number(row.confirmedOrders),
+      deliveredOrders: Number(row.deliveredOrders),
+      rejectedOrders:  Number(row.rejectedOrders)
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/retailers/list', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT DISTINCT "retailerName", city, area FROM "Orders" ORDER BY "retailerName"`
+    );
+    res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -466,6 +587,20 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
       } else {
         msg = getRejectionMessage(rejectCategory, rejectReason, o);
         notifType = 'alert';
+
+        // ── Restore stock when order is rejected (it was deducted on placement)
+        if (o.productId) {
+          try {
+            await pool.query(
+              `UPDATE "Stock"
+               SET "availableUnits" = "availableUnits" + $1,
+                   "availableKg"    = "availableKg"    + $2
+               WHERE id = $3`,
+              [parseInt(o.items)||0, parseFloat(o.kg)||0, o.productId]
+            );
+            console.log(`[stock-restore] Restored ${o.items} units for product ${o.productId} — order ${o.id} rejected`);
+          } catch(e) { console.warn('[stock-restore]', e.message); }
+        }
 
         // ── If rejected for out_of_stock, register a stock watch
         if (rejectCategory === 'out_of_stock' && o.productId) {
@@ -2201,14 +2336,21 @@ app.get('/api/tracking', auth, async (req, res) => {
 
 // ── Stock Restocked Notification (call when warehouse updates stock)
 app.put('/api/stock/:id/update', auth, async (req, res) => {
-  const { availableUnits, availableKg } = req.body;
+  const { availableUnits, availableKg, lowStockThreshold } = req.body;
   const productId = req.params.id;
   try {
-    // Update stock levels
-    await pool.query(
-      `UPDATE "Stock" SET "availableUnits"=$1, "availableKg"=$2 WHERE id=$3`,
-      [availableUnits, availableKg, productId]
-    );
+    // Update stock levels (include lowStockThreshold if provided)
+    if (lowStockThreshold !== undefined) {
+      await pool.query(
+        `UPDATE "Stock" SET "availableUnits"=$1, "availableKg"=$2, "lowStockThreshold"=$3 WHERE id=$4`,
+        [availableUnits, availableKg, lowStockThreshold, productId]
+      );
+    } else {
+      await pool.query(
+        `UPDATE "Stock" SET "availableUnits"=$1, "availableKg"=$2 WHERE id=$3`,
+        [availableUnits, availableKg, productId]
+      );
+    }
 
     // Check for orders that were rejected for out_of_stock and are watching this product
     let watchedOrders = [];
@@ -2247,7 +2389,32 @@ Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
       console.log(`[stock-watch] Notified retailer ${o.retailerId} for order ${o.id} — stock restored`);
     }
 
-    res.json({ ok: true, restockedCount: watchedOrders.length });
+    // ── Notify retailers on the WaitingList for this product ──
+    let waitingListRows = [];
+    try {
+      waitingListRows = (await pool.query(
+        `SELECT wl.id, wl."retailerId", wl."retailerName", wl."productName", wl."requestedQty"
+         FROM "WaitingList" wl
+         WHERE wl."productId"=$1 AND wl.status='waiting'
+         ORDER BY wl."createdAt" ASC`,
+        [productId]
+      )).rows;
+    } catch(e) { console.warn('[waiting-list query]', e.message); }
+
+    for (const w of waitingListRows) {
+      await notify(
+        w.retailerId,
+        `🟢 Stock Available — Place Your Order Now`,
+        `Good news! ${w.productName} you were waiting for is back in stock.\n\nYou requested ${w.requestedQty} units — head to the Order section to place your order now.`,
+        'success'
+      );
+      try {
+        await pool.query(`UPDATE "WaitingList" SET status='notified' WHERE id=$1`, [w.id]);
+      } catch {}
+      console.log(`[waiting-list] Notified retailer ${w.retailerId} — product ${productId} restocked`);
+    }
+
+    res.json({ ok: true, restockedCount: watchedOrders.length, waitingListNotified: waitingListRows.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2256,8 +2423,10 @@ app.get('/api/stock', auth, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT s.id, s."productName", s."availableUnits", s."availableKg", s."weightPerUnit",
-       (SELECT COUNT(*) FROM "Orders" o WHERE o."productId"=s.id AND o.status='rejected'
-        AND o."rejectCategory"='out_of_stock' AND o."stockWatchActive"=true) AS "watchCount"
+              COALESCE(s."lowStockThreshold", 50) AS "lowStockThreshold",
+              (SELECT COUNT(*) FROM "Orders" o WHERE o."productId"=s.id AND o.status='rejected'
+               AND o."rejectCategory"='out_of_stock' AND o."stockWatchActive"=true) AS "watchCount",
+              (SELECT COUNT(*) FROM "WaitingList" wl WHERE wl."productId"=s.id AND wl.status='waiting') AS "waitingCount"
        FROM "Stock" s ORDER BY s."productName"`
     );
     res.json(r.rows);
@@ -2412,6 +2581,167 @@ Please confirm receipt in the app to finalise.`,
     console.error('[PIN]', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ══════════════════════════════════════════════
+// SMART STOCK — real-time single product check
+// ══════════════════════════════════════════════
+
+// GET /api/stock/:productId — called by frontend on product select
+app.get('/api/stock/:productId', auth, async (req, res) => {
+  const productId = parseInt(req.params.productId);
+  if (!productId || productId <= 0) {
+    return res.status(400).json({ error: 'Invalid productId' });
+  }
+  try {
+    const r = await pool.query(
+      `SELECT id, "productName", "availableUnits", "availableKg", "weightPerUnit",
+              COALESCE("lowStockThreshold", 50) AS "lowStockThreshold"
+       FROM "Stock" WHERE id=$1`,
+      [productId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Product not found' });
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// WAITING LIST
+// ══════════════════════════════════════════════
+
+// POST /api/waiting-list — retailer joins waiting list for out-of-stock product
+app.post('/api/waiting-list', auth, async (req, res) => {
+  const { retailerId, retailerName, productId, productName, requestedQty } = req.body;
+  if (!retailerId || !productId || !requestedQty) {
+    return res.status(400).json({ error: 'retailerId, productId and requestedQty are required' });
+  }
+  if (Number(requestedQty) <= 0) {
+    return res.status(400).json({ error: 'requestedQty must be a positive number' });
+  }
+  try {
+    // Prevent duplicate entries for same retailer + product
+    const existing = await pool.query(
+      `SELECT id FROM "WaitingList" WHERE "retailerId"=$1 AND "productId"=$2 AND status='waiting'`,
+      [retailerId, productId]
+    );
+    if (existing.rows.length) {
+      return res.status(409).json({ error: 'You are already on the waiting list for this product' });
+    }
+
+    const r = await pool.query(
+      `INSERT INTO "WaitingList"("retailerId","retailerName","productId","productName","requestedQty","createdAt",status)
+       VALUES($1,$2,$3,$4,$5,NOW(),'waiting') RETURNING id`,
+      [retailerId, retailerName, productId, productName, Number(requestedQty)]
+    );
+
+    // Notify warehouse so they know to restock
+    const whUsers = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+    for (const u of whUsers.rows) {
+      await notify(
+        u.id,
+        `⏳ New Waiting List Entry — ${productName}`,
+        `${retailerName} has joined the waiting list for ${productName} (${requestedQty} units).\nRestock this product when possible to fulfil pending demand.`,
+        'info'
+      );
+    }
+
+    // Confirm to retailer
+    await notify(
+      retailerId,
+      '📋 Added to Waiting List',
+      `You have been added to the waiting list for ${productName} (${requestedQty} units).\n\nWe will notify you as soon as stock is replenished so you can place your order.`,
+      'info'
+    );
+
+    res.json({ ok: true, id: r.rows[0].id });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/waiting-list — warehouse/order_team/admin view of all waiting entries
+app.get('/api/waiting-list', auth, async (req, res) => {
+  const allowed = ['warehouse', 'order_team', 'admin'];
+  if (!allowed.includes(req.user?.role)) {
+    return res.status(403).json({ error: 'Access restricted to warehouse and order team' });
+  }
+  try {
+    const r = await pool.query(
+      `SELECT wl.id, wl."retailerName", wl."productName", wl."requestedQty", wl.status,
+              TO_CHAR(wl."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon HH24:MI') AS "createdAt"
+       FROM "WaitingList" wl
+       ORDER BY wl."createdAt" DESC`
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/waiting-list/:id — warehouse removes a fulfilled/cancelled entry
+app.delete('/api/waiting-list/:id', auth, async (req, res) => {
+  const allowed = ['warehouse', 'order_team', 'admin'];
+  if (!allowed.includes(req.user?.role)) {
+    return res.status(403).json({ error: 'Access restricted' });
+  }
+  try {
+    const r = await pool.query(
+      `DELETE FROM "WaitingList" WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Waiting list entry not found' });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// ORDER REMINDER
+// ══════════════════════════════════════════════
+
+// GET /api/order-reminder — returns retailer's reminder info (last order, frequency, next due)
+app.get('/api/order-reminder', auth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const userRow = await pool.query(
+      `SELECT COALESCE("orderFrequency", 'weekly') AS "orderFrequency" FROM "Users" WHERE id=$1`,
+      [userId]
+    );
+    const frequency = userRow.rows[0]?.orderFrequency || 'weekly';
+
+    const lastOrderRow = await pool.query(
+      `SELECT MAX("createdAt") AS "lastOrderDate" FROM "Orders" WHERE "retailerId"=$1`,
+      [userId]
+    );
+    const lastOrderDate = lastOrderRow.rows[0]?.lastOrderDate || null;
+
+    let nextDueDate = null;
+    let daysUntilDue = null;
+    let isOverdue = false;
+
+    if (lastOrderDate) {
+      const intervalDays = frequency === 'monthly' ? 30 : 7;
+      const next = new Date(lastOrderDate);
+      next.setDate(next.getDate() + intervalDays);
+      nextDueDate = next.toISOString();
+      const now = new Date();
+      daysUntilDue = Math.floor((next - now) / (1000 * 60 * 60 * 24));
+      isOverdue = daysUntilDue < 0;
+    }
+
+    res.json({ frequency, lastOrderDate, nextDueDate, daysUntilDue, isOverdue });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/order-reminder/frequency — retailer updates their order frequency preference
+app.put('/api/order-reminder/frequency', auth, async (req, res) => {
+  const { frequency } = req.body;
+  if (!['weekly', 'monthly'].includes(frequency)) {
+    return res.status(400).json({ error: 'frequency must be "weekly" or "monthly"' });
+  }
+  try {
+    const r = await pool.query(
+      `UPDATE "Users" SET "orderFrequency"=$1 WHERE id=$2 RETURNING id`,
+      [frequency, req.user.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true, frequency });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => console.log(`Nestlé DMS API running on port ${PORT}`));
