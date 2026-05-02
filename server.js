@@ -43,6 +43,11 @@ const { Pool } = require('pg');
  *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "isPartial"        BOOLEAN DEFAULT false;
  *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "originalQty"      INTEGER;
  *  ALTER TABLE "Users"  ADD COLUMN IF NOT EXISTS "orderFrequency"   VARCHAR(10) DEFAULT 'weekly';
+ *
+ * ── SALES REP ROUTING & BULK ORDERS MIGRATION (run once in Neon):
+ *
+ *  ALTER TABLE "Users"  ADD COLUMN IF NOT EXISTS "assignedCity" VARCHAR(100);
+ *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "orderDate"    DATE;
  */
 
 const app = express();
@@ -140,7 +145,7 @@ const token = jwt.sign(
   JWT_SECRET,
   { expiresIn: '24h' }  // ← changed from 8h to 24h
 );
-    res.json({ id: u.id, name: u.name, email: u.Email, role: u.role, avatar: u.avatar, token });
+    res.json({ id: u.id, name: u.name, email: u.Email, role: u.role, avatar: u.avatar, token, assignedCity: u.assignedCity || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -310,6 +315,20 @@ async function checkStock(productId, items, kg) {
   }
 }
 
+// ── Date-based priority: today/tomorrow=urgent, ≤5 days=high, else keep fallback
+function computePriority(orderDate, fallback = 'normal') {
+  if (!orderDate) return fallback;
+  try {
+    const now  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Colombo' }));
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const target = new Date(orderDate);
+    const diff  = Math.round((target - today) / 86400000);
+    if (diff <= 1) return 'urgent';
+    if (diff <= 5) return 'high';
+    return fallback;
+  } catch { return fallback; }
+}
+
 // ══════════════════════════════════════════════
 // ORDERS
 // ══════════════════════════════════════════════
@@ -329,6 +348,22 @@ app.get('/api/orders', auth, async (req, res) => {
          LEFT JOIN "Deliveries" d ON d."orderId" = o.id
          WHERE o."retailerId"=$1 ORDER BY o."createdAt" DESC`,
         [userId]
+      );
+    } else if (role === 'sales_rep') {
+      // Sales rep only sees pending orders for their assigned city
+      const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
+      const srCity = srRow.rows[0]?.assignedCity;
+      if (!srCity) return res.status(400).json({ error: 'No city assigned to your account. Contact admin.' });
+      r = await pool.query(
+        `SELECT id, "retailerName" AS retailer, city, area, items, kg,
+         priority AS prio, status, "confirmedBy", "rejectReason",
+         COALESCE("rejectCategory",'other') AS "rejectCategory",
+         TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
+         COALESCE("orderDate"::text,'') AS "orderDate"
+         FROM "Orders"
+         WHERE LOWER(city)=LOWER($1) AND status='pending'
+         ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "createdAt" ASC`,
+        [srCity]
       );
     } else {
       r = await pool.query(
@@ -480,21 +515,144 @@ app.post('/api/orders', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
+// BULK ORDERS
+// ══════════════════════════════════════════════
+app.post('/api/orders/bulk', auth, async (req, res) => {
+  const { retailerId, retailerName, orders } = req.body;
+  if (!Array.isArray(orders) || !orders.length) {
+    return res.status(400).json({ error: 'orders array is required' });
+  }
+
+  const results = [];
+  const failed  = [];
+  const client  = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    for (const order of orders) {
+      const { city, area, productId, productName, items, priority, notes, orderDate } = order;
+      const itemsNum     = Number(items);
+      const productIdNum = productId ? Number(productId) : 0;
+
+      if (!city || !area || !productIdNum || !Number.isInteger(itemsNum) || itemsNum <= 0) {
+        failed.push({ productName: productName || `Product ${productIdNum}`, reason: 'Missing required fields' });
+        continue;
+      }
+
+      // Date-based priority
+      const computedPriority = computePriority(orderDate, priority || 'normal');
+
+      // Stock check inside transaction
+      const stockRow = await client.query(
+        `SELECT "productName", "availableUnits" FROM "Stock" WHERE id=$1`, [productIdNum]
+      );
+      if (stockRow.rows.length && itemsNum > parseInt(stockRow.rows[0].availableUnits)) {
+        failed.push({
+          productName: productName || stockRow.rows[0].productName,
+          reason: `Only ${stockRow.rows[0].availableUnits} units available`
+        });
+        continue;
+      }
+
+      // Insert order — try with orderDate column, fallback without
+      let orderId;
+      try {
+        const r = await client.query(
+          `INSERT INTO "Orders"("retailerId","retailerName",city,area,items,kg,priority,notes,"productId",status,"orderDate","createdAt")
+           VALUES($1,$2,$3,$4,$5,0,$6,$7,$8,'pending',$9,NOW()) RETURNING id`,
+          [retailerId, retailerName, city, area.trim(), itemsNum, computedPriority, notes||'', productIdNum, orderDate||null]
+        );
+        orderId = r.rows[0].id;
+      } catch {
+        const r = await client.query(
+          `INSERT INTO "Orders"("retailerId","retailerName",city,area,items,kg,priority,notes,"productId",status,"createdAt")
+           VALUES($1,$2,$3,$4,$5,0,$6,$7,$8,'pending',NOW()) RETURNING id`,
+          [retailerId, retailerName, city, area.trim(), itemsNum, computedPriority, notes||'', productIdNum]
+        );
+        orderId = r.rows[0].id;
+      }
+
+      // Deduct stock
+      await client.query(
+        `UPDATE "Stock" SET "availableUnits"=GREATEST(0,"availableUnits"-$1) WHERE id=$2`,
+        [itemsNum, productIdNum]
+      );
+
+      // Low stock alert check
+      try {
+        const sNow = await client.query(
+          `SELECT "productName","availableUnits",COALESCE("lowStockThreshold",50) AS "lowStockThreshold" FROM "Stock" WHERE id=$1`,
+          [productIdNum]
+        );
+        if (sNow.rows.length && parseInt(sNow.rows[0].availableUnits) <= parseInt(sNow.rows[0].lowStockThreshold)) {
+          const whUsers = await client.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
+          for (const u of whUsers.rows) {
+            await notify(u.id, `⚠️ Low Stock — ${sNow.rows[0].productName}`,
+              `Stock running low after bulk order. ${sNow.rows[0].availableUnits} units remaining.`, 'warning');
+          }
+        }
+      } catch {}
+
+      results.push({ id: orderId, productName, computedPriority, status: 'placed' });
+    }
+
+    await client.query('COMMIT');
+
+    if (!results.length) {
+      return res.status(422).json({ ok: false, results, failed });
+    }
+
+    // Notify sales rep for this city and order_team
+    const orderCity = orders[0]?.city;
+    if (orderCity) {
+      try {
+        const srUsers = await pool.query(
+          `SELECT id FROM "Users" WHERE role='sales_rep' AND LOWER("assignedCity")=LOWER($1)`, [orderCity]
+        );
+        const summary = results.map(r => `• ${r.productName} (${orders.find(o=>o.productName===r.productName)?.items||'?'} units) — priority: ${r.computedPriority}`).join('\n');
+        for (const u of srUsers.rows) {
+          await notify(u.id, `📋 New Orders — ${orderCity}`,
+            `${retailerName} placed ${results.length} order(s):\n${summary}`, 'info');
+        }
+        const optUsers = await pool.query(`SELECT id FROM "Users" WHERE role='order_team'`);
+        for (const u of optUsers.rows) {
+          await notify(u.id, `📋 Bulk Order — ${retailerName}`,
+            `${results.length} order(s) from ${retailerName} (${orderCity}) awaiting sales rep review.`, 'info');
+        }
+      } catch(e) { console.warn('[bulk-notify]', e.message); }
+    }
+
+    const httpStatus = failed.length ? 207 : 200;
+    res.status(httpStatus).json({ ok: true, results, failed });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ══════════════════════════════════════════════
 // SALES REP
 // ══════════════════════════════════════════════
 app.get('/api/sales-rep/dashboard', auth, async (req, res) => {
   try {
+    const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
+    const city  = srRow.rows[0]?.assignedCity || null;
+    const where = city ? `WHERE LOWER(city)=LOWER('${city.replace(/'/g,"''")}')` : '';
     const r = await pool.query(
       `SELECT
          COUNT(*)                                          AS "totalOrders",
          COUNT(*) FILTER (WHERE status='pending')         AS "pendingOrders",
-         COUNT(*) FILTER (WHERE status='confirmed')       AS "confirmedOrders",
+         COUNT(*) FILTER (WHERE status='confirmed' OR status='consolidated') AS "confirmedOrders",
          COUNT(*) FILTER (WHERE status='delivered')       AS "deliveredOrders",
          COUNT(*) FILTER (WHERE status='rejected')        AS "rejectedOrders"
-       FROM "Orders"`
+       FROM "Orders" ${where}`
     );
     const row = r.rows[0];
     res.json({
+      city,
       totalOrders:     Number(row.totalOrders),
       pendingOrders:   Number(row.pendingOrders),
       confirmedOrders: Number(row.confirmedOrders),
@@ -554,12 +712,27 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
     return res.status(400).json({ error: 'A rejection category is required' });
   }
 
+  // Only order_team, admin, and sales_rep can confirm/reject
+  const allowedRoles = ['order_team', 'admin', 'sales_rep'];
+  if (!allowedRoles.includes(req.user?.role)) {
+    return res.status(403).json({ error: 'Not authorised to confirm or reject orders' });
+  }
+
   const status = action === 'confirm' ? 'confirmed' : 'rejected';
   try {
-    const check = await pool.query('SELECT status FROM "Orders" WHERE id=$1', [req.params.id]);
+    const check = await pool.query('SELECT status, city FROM "Orders" WHERE id=$1', [req.params.id]);
     if (!check.rows.length) return res.status(404).json({ error: 'Order not found' });
     if (check.rows[0].status !== 'pending') {
       return res.status(400).json({ error: `Order is already "${check.rows[0].status}" — cannot change` });
+    }
+
+    // Sales rep city restriction
+    if (req.user?.role === 'sales_rep') {
+      const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
+      const srCity = srRow.rows[0]?.assignedCity;
+      if (!srCity || check.rows[0].city?.toLowerCase() !== srCity.toLowerCase()) {
+        return res.status(403).json({ error: 'You can only manage orders from your assigned city' });
+      }
     }
 
     // Store category alongside reason
