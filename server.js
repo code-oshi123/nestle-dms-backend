@@ -640,16 +640,23 @@ app.get('/api/sales-rep/dashboard', auth, async (req, res) => {
   try {
     const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
     const city  = srRow.rows[0]?.assignedCity || null;
-    const where = city ? `WHERE LOWER(city)=LOWER('${city.replace(/'/g,"''")}')` : '';
-    const r = await pool.query(
-      `SELECT
-         COUNT(*)                                          AS "totalOrders",
-         COUNT(*) FILTER (WHERE status='pending')         AS "pendingOrders",
-         COUNT(*) FILTER (WHERE status='confirmed' OR status='consolidated') AS "confirmedOrders",
-         COUNT(*) FILTER (WHERE status='delivered')       AS "deliveredOrders",
-         COUNT(*) FILTER (WHERE status='rejected')        AS "rejectedOrders"
-       FROM "Orders" ${where}`
-    );
+    const r = city
+      ? await pool.query(
+          `SELECT
+             COUNT(*)                                          AS "totalOrders",
+             COUNT(*) FILTER (WHERE status='pending')         AS "pendingOrders",
+             COUNT(*) FILTER (WHERE status='confirmed' OR status='consolidated') AS "confirmedOrders",
+             COUNT(*) FILTER (WHERE status='delivered')       AS "deliveredOrders",
+             COUNT(*) FILTER (WHERE status='rejected')        AS "rejectedOrders"
+           FROM "Orders" WHERE LOWER(city)=LOWER($1)`, [city])
+      : await pool.query(
+          `SELECT
+             COUNT(*)                                          AS "totalOrders",
+             COUNT(*) FILTER (WHERE status='pending')         AS "pendingOrders",
+             COUNT(*) FILTER (WHERE status='confirmed' OR status='consolidated') AS "confirmedOrders",
+             COUNT(*) FILTER (WHERE status='delivered')       AS "deliveredOrders",
+             COUNT(*) FILTER (WHERE status='rejected')        AS "rejectedOrders"
+           FROM "Orders"`);
     const row = r.rows[0];
     res.json({
       city,
@@ -726,12 +733,24 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
       return res.status(400).json({ error: `Order is already "${check.rows[0].status}" — cannot change` });
     }
 
-    // Sales rep city restriction
+    // Sales rep city restriction + 3-order minimum
     if (req.user?.role === 'sales_rep') {
       const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
       const srCity = srRow.rows[0]?.assignedCity;
       if (!srCity || check.rows[0].city?.toLowerCase() !== srCity.toLowerCase()) {
         return res.status(403).json({ error: 'You can only manage orders from your assigned city' });
+      }
+      if (action === 'confirm') {
+        const pendingRow = await pool.query(
+          `SELECT COUNT(*) FROM "Orders" WHERE LOWER(city)=LOWER($1) AND status='pending'`,
+          [srCity]
+        );
+        const pendingCount = parseInt(pendingRow.rows[0].count);
+        if (pendingCount < 3) {
+          return res.status(400).json({
+            error: `${pendingCount} pending order${pendingCount === 1 ? '' : 's'} in ${srCity} — need at least 3 before confirming`
+          });
+        }
       }
     }
 
