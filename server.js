@@ -48,6 +48,16 @@ const { Pool } = require('pg');
  *
  *  ALTER TABLE "Users"  ADD COLUMN IF NOT EXISTS "assignedCity" VARCHAR(100);
  *  ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "orderDate"    DATE;
+ *
+ * ── SPRINT 3 WAITLIST MIGRATION (run once in Neon):
+ *
+ *  ALTER TABLE "WaitingList" ADD COLUMN IF NOT EXISTS "type" VARCHAR(10) DEFAULT 'full';
+ *  ALTER TABLE "WaitingList" ADD COLUMN IF NOT EXISTS "city" VARCHAR(100);
+ *  ALTER TABLE "WaitingList" ADD COLUMN IF NOT EXISTS "area" VARCHAR(100);
+ *
+ * ── SPRINT 3 USER CITY MIGRATION (run once in Neon):
+ *
+ *  ALTER TABLE "Users" ADD COLUMN IF NOT EXISTS "city" VARCHAR(100);
  */
 
 const app = express();
@@ -145,7 +155,7 @@ const token = jwt.sign(
   JWT_SECRET,
   { expiresIn: '24h' }  // ← changed from 8h to 24h
 );
-    res.json({ id: u.id, name: u.name, email: u.Email, role: u.role, avatar: u.avatar, token, assignedCity: u.assignedCity || null });
+    res.json({ id: u.id, name: u.name, email: u.Email, role: u.role, avatar: u.avatar, token, assignedCity: u.assignedCity || null, city: u.city || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -548,9 +558,15 @@ app.post('/api/orders/bulk', auth, async (req, res) => {
         `SELECT "productName", "availableUnits" FROM "Stock" WHERE id=$1`, [productIdNum]
       );
       if (stockRow.rows.length && itemsNum > parseInt(stockRow.rows[0].availableUnits)) {
+        const avail = parseInt(stockRow.rows[0].availableUnits);
         failed.push({
+          productId: productIdNum,
           productName: productName || stockRow.rows[0].productName,
-          reason: `Only ${stockRow.rows[0].availableUnits} units available`
+          reason: avail > 0
+            ? `Only ${avail} units available (you requested ${itemsNum})`
+            : `Out of stock (you requested ${itemsNum})`,
+          availableUnits: avail,
+          requestedQty: itemsNum
         });
         continue;
       }
@@ -2385,7 +2401,7 @@ app.get('/api/retailers', auth, orderTeamOnly, async (req, res) => {
 });
 
 app.post('/api/retailers', auth, orderTeamOnly, async (req, res) => {
-  const { name, email, password, avatar } = req.body;
+  const { name, email, password, avatar, city } = req.body;
   if (!name||!name.trim())   return res.status(400).json({ error: 'Name is required' });
   if (!email||!email.trim()) return res.status(400).json({ error: 'Email is required' });
   if (!password||password.length<4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
@@ -2396,9 +2412,9 @@ app.post('/api/retailers', auth, orderTeamOnly, async (req, res) => {
     const initials = (avatar&&avatar.trim()) ? avatar.trim().toUpperCase().slice(0,2)
       : name.trim().split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
     const r = await pool.query(
-      `INSERT INTO "Users"(name,"Email","PasswordHash",role,avatar,"createdAt")
-       VALUES($1,$2,$3,'retailer',$4,NOW()) RETURNING id,name,"Email",role,avatar`,
-      [name.trim(), email.trim(), hash, initials]
+      `INSERT INTO "Users"(name,"Email","PasswordHash",role,avatar,city,"createdAt")
+       VALUES($1,$2,$3,'retailer',$4,$5,NOW()) RETURNING id,name,"Email",role,avatar,city`,
+      [name.trim(), email.trim(), hash, initials, city||null]
     );
     res.json({ ok: true, user: r.rows[0] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -2594,12 +2610,14 @@ Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
     } catch(e) { console.warn('[waiting-list query]', e.message); }
 
     for (const w of waitingListRows) {
-      await notify(
-        w.retailerId,
-        `🟢 Stock Available — Place Your Order Now`,
-        `Good news! ${w.productName} you were waiting for is back in stock.\n\nYou requested ${w.requestedQty} units — head to the Order section to place your order now.`,
-        'success'
-      );
+      const canFulfil = w.type === 'partial' || availableUnits >= parseInt(w.requestedQty);
+      if (!canFulfil) continue; // full waitlist: only notify when stock covers their full qty
+
+      const msg = w.type === 'partial'
+        ? `Your partial waitlist slot for ${w.productName} is being processed by the warehouse — ${w.requestedQty} units have been reserved for you.`
+        : `Great news! ${w.productName} is back in stock. You requested ${w.requestedQty} units — head to the Order section to place your order now.`;
+
+      await notify(w.retailerId, `🟢 Stock Available — ${w.productName}`, msg, 'success');
       try {
         await pool.query(`UPDATE "WaitingList" SET status='notified' WHERE id=$1`, [w.id]);
       } catch {}
@@ -2610,7 +2628,7 @@ Tap "Resubmit" on your rejected order to pre-fill the form automatically.`,
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Get all stock levels (for warehouse stock management page)
+// ── Get all stock levels with folded restock suggestion
 app.get('/api/stock', auth, async (req, res) => {
   try {
     const r = await pool.query(
@@ -2618,7 +2636,15 @@ app.get('/api/stock', auth, async (req, res) => {
               COALESCE(s."lowStockThreshold", 50) AS "lowStockThreshold",
               (SELECT COUNT(*) FROM "Orders" o WHERE o."productId"=s.id AND o.status='rejected'
                AND o."rejectCategory"='out_of_stock' AND o."stockWatchActive"=true) AS "watchCount",
-              (SELECT COUNT(*) FROM "WaitingList" wl WHERE wl."productId"=s.id AND wl.status='waiting') AS "waitingCount"
+              (SELECT COUNT(*) FROM "WaitingList" wl WHERE wl."productId"=s.id AND wl.status='waiting') AS "waitingCount",
+              (SELECT COALESCE(SUM(wl2."requestedQty"),0) FROM "WaitingList" wl2
+               WHERE wl2."productId"=s.id AND wl2.type='partial' AND wl2.status='waiting') AS "reservedUnits",
+              CEIL(
+                COALESCE((SELECT SUM(o2.items) FROM "Orders" o2
+                 WHERE o2."productId"=s.id
+                   AND o2.status IN ('confirmed','consolidated','delivered')
+                   AND o2."createdAt" >= NOW() - INTERVAL '30 days'), 0) / 30.0 * 14
+              ) AS "suggestedRestock"
        FROM "Stock" s ORDER BY s."productName"`
     );
     res.json(r.rows);
@@ -2802,38 +2828,52 @@ app.get('/api/stock/:productId', auth, async (req, res) => {
 // ══════════════════════════════════════════════
 
 // POST /api/waiting-list — retailer joins waiting list for out-of-stock product
+// type: 'full' = wants full requestedQty when restocked; 'partial' = take available units now
 app.post('/api/waiting-list', auth, async (req, res) => {
-  const { retailerId, retailerName, productId, productName, requestedQty } = req.body;
+  const { retailerId, retailerName, productId, productName, requestedQty, type, city, area } = req.body;
   if (!retailerId || !productId || !requestedQty) {
     return res.status(400).json({ error: 'retailerId, productId and requestedQty are required' });
   }
   if (Number(requestedQty) <= 0) {
     return res.status(400).json({ error: 'requestedQty must be a positive number' });
   }
+  const wlType = ['full', 'partial'].includes(type) ? type : 'full';
   try {
-    // Prevent duplicate entries for same retailer + product
+    // Prevent duplicate entry for same retailer + product + type
     const existing = await pool.query(
-      `SELECT id FROM "WaitingList" WHERE "retailerId"=$1 AND "productId"=$2 AND status='waiting'`,
-      [retailerId, productId]
+      `SELECT id FROM "WaitingList" WHERE "retailerId"=$1 AND "productId"=$2 AND type=$3 AND status='waiting'`,
+      [retailerId, productId, wlType]
     );
     if (existing.rows.length) {
-      return res.status(409).json({ error: 'You are already on the waiting list for this product' });
+      return res.status(409).json({ error: `You are already on the ${wlType} waiting list for this product` });
     }
 
     const r = await pool.query(
-      `INSERT INTO "WaitingList"("retailerId","retailerName","productId","productName","requestedQty","createdAt",status)
-       VALUES($1,$2,$3,$4,$5,NOW(),'waiting') RETURNING id`,
-      [retailerId, retailerName, productId, productName, Number(requestedQty)]
+      `INSERT INTO "WaitingList"("retailerId","retailerName","productId","productName","requestedQty","createdAt",status,type,city,area)
+       VALUES($1,$2,$3,$4,$5,NOW(),'waiting',$6,$7,$8) RETURNING id`,
+      [retailerId, retailerName, productId, productName, Number(requestedQty), wlType, city||null, area||null]
     );
 
-    // Notify warehouse so they know to restock
+    // Partial waitlist: reserve the stock immediately so it isn't taken by another order
+    if (wlType === 'partial') {
+      try {
+        await pool.query(
+          `UPDATE "Stock" SET "availableUnits"=GREATEST(0,"availableUnits"-$1) WHERE id=$2`,
+          [Number(requestedQty), productId]
+        );
+      } catch(e) { console.warn('[waitlist-reserve]', e.message); }
+    }
+
+    const typeLabel = wlType === 'partial' ? 'partial (available units)' : 'full quantity';
+
+    // Notify warehouse
     const whUsers = await pool.query(`SELECT id FROM "Users" WHERE role='warehouse'`);
     for (const u of whUsers.rows) {
       await notify(
         u.id,
-        `⏳ New Waiting List Entry — ${productName}`,
-        `${retailerName} has joined the waiting list for ${productName} (${requestedQty} units).\nRestock this product when possible to fulfil pending demand.`,
-        'info'
+        `⏳ Waiting List — ${productName} (${wlType})`,
+        `${retailerName} joined the ${typeLabel} waiting list for ${productName} (${Number(requestedQty)} units).`,
+        wlType === 'partial' ? 'warning' : 'info'
       );
     }
 
@@ -2841,43 +2881,113 @@ app.post('/api/waiting-list', auth, async (req, res) => {
     await notify(
       retailerId,
       '📋 Added to Waiting List',
-      `You have been added to the waiting list for ${productName} (${requestedQty} units).\n\nWe will notify you as soon as stock is replenished so you can place your order.`,
+      wlType === 'partial'
+        ? `You are on the partial waiting list for ${productName} — you will receive ${Number(requestedQty)} units as soon as they are processed.`
+        : `You are on the waiting list for ${productName} (${Number(requestedQty)} units). We will notify you when full stock is available.`,
       'info'
     );
 
-    res.json({ ok: true, id: r.rows[0].id });
+    res.json({ ok: true, id: r.rows[0].id, type: wlType });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/waiting-list — warehouse/order_team/admin view of all waiting entries
+// GET /api/waiting-list — warehouse/order_team/admin/sales_rep view
+// ?type=full|partial  filters by waitlist type
 app.get('/api/waiting-list', auth, async (req, res) => {
-  const allowed = ['warehouse', 'order_team', 'admin'];
+  const allowed = ['warehouse', 'order_team', 'admin', 'sales_rep'];
   if (!allowed.includes(req.user?.role)) {
-    return res.status(403).json({ error: 'Access restricted to warehouse and order team' });
+    return res.status(403).json({ error: 'Access restricted' });
   }
+  const typeFilter = ['full', 'partial'].includes(req.query.type) ? req.query.type : null;
   try {
-    const r = await pool.query(
-      `SELECT wl.id, wl."retailerName", wl."productName", wl."requestedQty", wl.status,
-              TO_CHAR(wl."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon HH24:MI') AS "createdAt"
-       FROM "WaitingList" wl
-       ORDER BY wl."createdAt" DESC`
-    );
+    let r;
+    if (req.user.role === 'sales_rep') {
+      const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
+      const srCity = srRow.rows[0]?.assignedCity;
+      if (!srCity) return res.status(400).json({ error: 'No city assigned to your account' });
+      const params = typeFilter ? [srCity, typeFilter] : [srCity];
+      r = await pool.query(
+        `SELECT wl.id, wl."retailerName", wl."productName", wl."requestedQty",
+                COALESCE(wl.type,'full') AS type, wl.city, wl.area, wl.status,
+                TO_CHAR(wl."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS "createdAt"
+         FROM "WaitingList" wl
+         WHERE wl.status='waiting' AND LOWER(wl.city)=LOWER($1) ${typeFilter ? 'AND wl.type=$2' : ''}
+         ORDER BY wl."createdAt" ASC`,
+        params
+      );
+    } else {
+      const params = typeFilter ? [typeFilter] : [];
+      r = await pool.query(
+        `SELECT wl.id, wl."retailerName", wl."productName", wl."requestedQty",
+                COALESCE(wl.type,'full') AS type, wl.city, wl.area, wl.status,
+                TO_CHAR(wl."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS "createdAt"
+         FROM "WaitingList" wl
+         WHERE wl.status='waiting' ${typeFilter ? 'AND wl.type=$1' : ''}
+         ORDER BY wl."createdAt" ASC`,
+        params
+      );
+    }
     res.json(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/waiting-list/:id — warehouse removes a fulfilled/cancelled entry
+// PUT /api/waiting-list/:id/fulfil — warehouse fulfils a partial waitlist entry
+app.put('/api/waiting-list/:id/fulfil', auth, async (req, res) => {
+  const allowed = ['warehouse', 'admin'];
+  if (!allowed.includes(req.user?.role)) return res.status(403).json({ error: 'Access restricted' });
+  try {
+    const entry = await pool.query(
+      `SELECT id, "retailerId", "productName", "requestedQty", type FROM "WaitingList" WHERE id=$1`,
+      [req.params.id]
+    );
+    if (!entry.rows.length) return res.status(404).json({ error: 'Entry not found' });
+    const w = entry.rows[0];
+    await pool.query(`UPDATE "WaitingList" SET status='fulfilled' WHERE id=$1`, [req.params.id]);
+    await notify(
+      w.retailerId,
+      `✅ Waitlist Fulfilled — ${w.productName}`,
+      `Your ${w.type === 'partial' ? 'partial' : 'full'} waitlist order for ${w.productName} (${w.requestedQty} units) has been processed by the warehouse and will be scheduled for delivery.`,
+      'success'
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/waiting-list/:id — warehouse cancels a waiting entry
 app.delete('/api/waiting-list/:id', auth, async (req, res) => {
   const allowed = ['warehouse', 'order_team', 'admin'];
   if (!allowed.includes(req.user?.role)) {
     return res.status(403).json({ error: 'Access restricted' });
   }
   try {
-    const r = await pool.query(
-      `DELETE FROM "WaitingList" WHERE id=$1 RETURNING id`,
+    // Fetch before deleting so we can notify and return stock
+    const entry = await pool.query(
+      `SELECT id, "retailerId", "productName", "requestedQty", type, status FROM "WaitingList" WHERE id=$1`,
       [req.params.id]
     );
-    if (!r.rows.length) return res.status(404).json({ error: 'Waiting list entry not found' });
+    if (!entry.rows.length) return res.status(404).json({ error: 'Waiting list entry not found' });
+    const w = entry.rows[0];
+
+    await pool.query(`DELETE FROM "WaitingList" WHERE id=$1`, [req.params.id]);
+
+    // Return reserved stock for cancelled partial entries
+    if (w.type === 'partial' && w.status === 'waiting') {
+      try {
+        await pool.query(
+          `UPDATE "Stock" SET "availableUnits"="availableUnits"+$1 WHERE "productName"=$2`,
+          [parseInt(w.requestedQty), w.productName]
+        );
+      } catch(e) { console.warn('[waitlist-cancel-stock-return]', e.message); }
+    }
+
+    // Notify the retailer
+    await notify(
+      w.retailerId,
+      `❌ Waitlist Entry Removed — ${w.productName}`,
+      `Your waiting list entry for ${w.productName} (${w.requestedQty} units) has been removed by the warehouse team. Please contact your sales rep for more information.`,
+      'warning'
+    );
+
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -2933,6 +3043,188 @@ app.put('/api/order-reminder/frequency', auth, async (req, res) => {
     );
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ ok: true, frequency });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// RETAILER LAST ORDER PRODUCTS
+// ══════════════════════════════════════════════
+
+// GET /api/orders/last-products — retailer's most recent order lines for quick reorder
+app.get('/api/orders/last-products', auth, async (req, res) => {
+  if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
+  try {
+    const r = await pool.query(
+      `SELECT o."productId", s."productName", o.items, o.city, o.area,
+              TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon') AS "orderedOn"
+       FROM "Orders" o
+       LEFT JOIN "Stock" s ON s.id=o."productId"
+       WHERE o."retailerId"=$1
+       ORDER BY o."createdAt" DESC
+       LIMIT 10`,
+      [req.user.id]
+    );
+    // De-duplicate by productId, keep most recent
+    const seen = new Set();
+    const unique = r.rows.filter(row => {
+      if (!row.productId || seen.has(row.productId)) return false;
+      seen.add(row.productId); return true;
+    });
+    res.json(unique.slice(0, 5));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// WAREHOUSE DASHBOARD
+// ══════════════════════════════════════════════
+
+// GET /api/warehouse/dashboard
+app.get('/api/warehouse/dashboard', auth, async (req, res) => {
+  const allowed = ['warehouse', 'admin'];
+  if (!allowed.includes(req.user?.role)) return res.status(403).json({ error: 'Access restricted' });
+  try {
+    const [stockRow, pendingRow, waitlistRow, lowStockRow, queueRow] = await Promise.all([
+      // Total + reserved stock across all products
+      pool.query(
+        `SELECT COALESCE(SUM("availableUnits"),0) AS "totalUnits",
+                COALESCE((SELECT SUM("requestedQty") FROM "WaitingList" WHERE type='partial' AND status='waiting'),0) AS "reservedUnits"
+         FROM "Stock"`
+      ),
+      // Pending orders count
+      pool.query(`SELECT COUNT(*) AS cnt FROM "Orders" WHERE status='pending'`),
+      // Waitlist counts
+      pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE type='full')    AS "fullCount",
+           COUNT(*) FILTER (WHERE type='partial') AS "partialCount"
+         FROM "WaitingList" WHERE status='waiting'`
+      ),
+      // Low stock products
+      pool.query(
+        `SELECT id, "productName", "availableUnits",
+                COALESCE("lowStockThreshold",50) AS "lowStockThreshold"
+         FROM "Stock"
+         WHERE "availableUnits" <= COALESCE("lowStockThreshold",50)
+         ORDER BY "availableUnits" ASC
+         LIMIT 5`
+      ),
+      // Full waitlist queue (FCFS)
+      pool.query(
+        `SELECT wl."retailerName", wl."productName", wl."requestedQty", wl.city,
+                TO_CHAR(wl."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS "joinedAt"
+         FROM "WaitingList" wl
+         WHERE wl.status='waiting'
+         ORDER BY wl."createdAt" ASC
+         LIMIT 6`
+      )
+    ]);
+
+    const total    = parseInt(stockRow.rows[0]?.totalUnits)    || 0;
+    const reserved = parseInt(stockRow.rows[0]?.reservedUnits) || 0;
+    res.json({
+      totalUnits:    total,
+      reservedUnits: reserved,
+      availableUnits: total - reserved,
+      pendingOrders:  parseInt(pendingRow.rows[0]?.cnt) || 0,
+      fullWaitlist:   parseInt(waitlistRow.rows[0]?.fullCount)    || 0,
+      partialWaitlist: parseInt(waitlistRow.rows[0]?.partialCount) || 0,
+      lowStockProducts: lowStockRow.rows,
+      waitlistQueue:    queueRow.rows
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// RESTOCK SUGGESTION
+// ══════════════════════════════════════════════
+
+// GET /api/restock-suggestion/:productId
+// Returns: suggested restock qty = avg daily demand (last 30 days) × 14-day buffer
+app.get('/api/restock-suggestion/:productId', auth, async (req, res) => {
+  const allowed = ['warehouse', 'admin'];
+  if (!allowed.includes(req.user?.role)) return res.status(403).json({ error: 'Access restricted' });
+  const productId = parseInt(req.params.productId);
+  if (!productId) return res.status(400).json({ error: 'Invalid productId' });
+  try {
+    const demandRow = await pool.query(
+      `SELECT COALESCE(SUM(items), 0) AS "totalDemand"
+       FROM "Orders"
+       WHERE "productId"=$1
+         AND status IN ('confirmed','consolidated','delivered')
+         AND "createdAt" >= NOW() - INTERVAL '30 days'`,
+      [productId]
+    );
+    const totalDemand = parseFloat(demandRow.rows[0]?.totalDemand) || 0;
+    const avgDailyDemand = totalDemand / 30;
+    const suggested = Math.ceil(avgDailyDemand * 14);
+    res.json({ productId, totalDemand, avgDailyDemand: parseFloat(avgDailyDemand.toFixed(2)), suggested });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
+// PRODUCT SUGGESTIONS
+// ══════════════════════════════════════════════
+
+// GET /api/suggest?city=Colombo
+// Old retailers (≥1 past order): top 5 by their own order history
+// New retailers (0 past orders): top 5 by order count in their city
+// Fallback: top 5 globally
+app.get('/api/suggest', auth, async (req, res) => {
+  if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
+  const city = req.query.city || '';
+  try {
+    const pastRow = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM "Orders" WHERE "retailerId"=$1`, [req.user.id]
+    );
+    const hasPastOrders = parseInt(pastRow.rows[0]?.cnt) > 0;
+
+    let suggestions;
+    if (hasPastOrders) {
+      // Personalised: based on their own order history
+      const r = await pool.query(
+        `SELECT o."productId", s."productName",
+                SUM(o.items) AS "totalOrdered", COUNT(*) AS "orderCount"
+         FROM "Orders" o
+         JOIN "Stock" s ON s.id=o."productId"
+         WHERE o."retailerId"=$1 AND o."productId" IS NOT NULL
+         GROUP BY o."productId", s."productName"
+         ORDER BY "orderCount" DESC, "totalOrdered" DESC
+         LIMIT 5`,
+        [req.user.id]
+      );
+      suggestions = r.rows.map(r => ({ ...r, basis: 'your history' }));
+    } else if (city) {
+      // New retailer: popular in their city
+      const r = await pool.query(
+        `SELECT o."productId", s."productName",
+                SUM(o.items) AS "totalOrdered", COUNT(*) AS "orderCount"
+         FROM "Orders" o
+         JOIN "Stock" s ON s.id=o."productId"
+         WHERE LOWER(o.city)=LOWER($1) AND o."productId" IS NOT NULL
+         GROUP BY o."productId", s."productName"
+         ORDER BY "orderCount" DESC, "totalOrdered" DESC
+         LIMIT 5`,
+        [city]
+      );
+      suggestions = r.rows.map(r => ({ ...r, basis: `popular in ${city}` }));
+    }
+
+    // Fallback: global top 5 if city had no data or no city given
+    if (!suggestions || !suggestions.length) {
+      const r = await pool.query(
+        `SELECT o."productId", s."productName",
+                SUM(o.items) AS "totalOrdered", COUNT(*) AS "orderCount"
+         FROM "Orders" o
+         JOIN "Stock" s ON s.id=o."productId"
+         WHERE o."productId" IS NOT NULL
+         GROUP BY o."productId", s."productName"
+         ORDER BY "orderCount" DESC, "totalOrdered" DESC
+         LIMIT 5`
+      );
+      suggestions = r.rows.map(r => ({ ...r, basis: 'popular overall' }));
+    }
+
+    res.json({ hasPastOrders, suggestions });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
