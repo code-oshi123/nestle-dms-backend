@@ -799,9 +799,32 @@ app.get('/api/sales-rep/dashboard', auth, async (req, res) => {
 
 app.get('/api/retailers/list', auth, async (req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT DISTINCT "retailerName", city, area FROM "Orders" ORDER BY "retailerName"`
-    );
+    // Pull from Users table (one row per retailer) so duplicates never appear.
+    // Sales reps only see retailers in their assigned city.
+    let r;
+    if (req.user?.role === 'sales_rep') {
+      const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
+      const srCity = srRow.rows[0]?.assignedCity;
+      if (srCity) {
+        r = await pool.query(
+          `SELECT id, name AS "retailerName", city, "Email" AS email
+           FROM "Users"
+           WHERE role='retailer' AND LOWER(city)=LOWER($1)
+           ORDER BY name`,
+          [srCity]
+        );
+      } else {
+        r = await pool.query(
+          `SELECT id, name AS "retailerName", city, "Email" AS email
+           FROM "Users" WHERE role='retailer' ORDER BY name`
+        );
+      }
+    } else {
+      r = await pool.query(
+        `SELECT id, name AS "retailerName", city, "Email" AS email
+         FROM "Users" WHERE role='retailer' ORDER BY name`
+      );
+    }
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
