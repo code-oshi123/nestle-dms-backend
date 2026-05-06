@@ -3129,27 +3129,35 @@ app.put('/api/order-reminder/frequency', auth, async (req, res) => {
 // RETAILER LAST ORDER PRODUCTS
 // ══════════════════════════════════════════════
 
-// GET /api/orders/last-products — retailer's most recent order lines for quick reorder
+// GET /api/orders/last-products — all products from the retailer's most recent order batch
 app.get('/api/orders/last-products', auth, async (req, res) => {
   if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
   try {
+    const latest = await pool.query(
+      `SELECT MAX("createdAt") AS ts FROM "Orders" WHERE "retailerId"=$1`,
+      [req.user.id]
+    );
+    if (!latest.rows[0]?.ts) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
+    const ts = latest.rows[0].ts;
     const r = await pool.query(
-      `SELECT o."productId", s."productName", o.items, o.city, o.area,
-              TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon') AS "orderedOn"
+      `SELECT o."productId", s."productName", o.items, o.city, o.area, o.priority,
+              TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY') AS "orderDate"
        FROM "Orders" o
        LEFT JOIN "Stock" s ON s.id=o."productId"
        WHERE o."retailerId"=$1
-       ORDER BY o."createdAt" DESC
-       LIMIT 10`,
-      [req.user.id]
+         AND o."createdAt" >= $2::timestamptz - INTERVAL '30 seconds'
+       ORDER BY o."createdAt" ASC`,
+      [req.user.id, ts]
     );
-    // De-duplicate by productId, keep most recent
-    const seen = new Set();
-    const unique = r.rows.filter(row => {
-      if (!row.productId || seen.has(row.productId)) return false;
-      seen.add(row.productId); return true;
+    if (!r.rows.length) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
+    const first = r.rows[0];
+    res.json({
+      orderDate: first.orderDate,
+      city:      first.city,
+      area:      first.area,
+      priority:  first.priority,
+      products:  r.rows.map(row => ({ productId: row.productId, productName: row.productName, items: row.items }))
     });
-    res.json(unique.slice(0, 5));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
