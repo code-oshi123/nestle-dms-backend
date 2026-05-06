@@ -3129,39 +3129,20 @@ app.put('/api/order-reminder/frequency', auth, async (req, res) => {
 // RETAILER LAST ORDER PRODUCTS
 // ══════════════════════════════════════════════
 
-// GET /api/orders/last-products — all products from the retailer's most recent order batch
+// GET /api/orders/last-products — all products from the retailer's most recent order date
 app.get('/api/orders/last-products', auth, async (req, res) => {
   if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
   try {
-    // Use MAX(id) — always reliable even when createdAt is NULL
-    const latest = await pool.query(
-      `SELECT id, "createdAt" FROM "Orders" WHERE "retailerId"=$1 ORDER BY id DESC LIMIT 1`,
+    const r = await pool.query(
+      `SELECT o."productId", s."productName", o.items, o.city, o.area, o.priority,
+              TO_CHAR(o."orderDate"::date, 'DD Mon YYYY') AS "orderDate"
+       FROM "Orders" o
+       LEFT JOIN "Stock" s ON s.id = o."productId"
+       WHERE o."retailerId" = $1
+         AND o."orderDate" = (SELECT MAX("orderDate") FROM "Orders" WHERE "retailerId" = $1)
+       ORDER BY o.id ASC`,
       [req.user.id]
     );
-    if (!latest.rows[0]) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
-
-    const latestId = latest.rows[0].id;
-    const ts       = latest.rows[0].createdAt;
-
-    // Batch strategy: timestamp window if available, else ID window (±9 rows)
-    const r = ts
-      ? await pool.query(
-          `SELECT o."productId", s."productName", o.items, o.city, o.area, o.priority,
-                  TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY') AS "orderDate"
-           FROM "Orders" o LEFT JOIN "Stock" s ON s.id=o."productId"
-           WHERE o."retailerId"=$1 AND o."createdAt" >= $2::timestamptz - INTERVAL '30 seconds'
-           ORDER BY o.id ASC`,
-          [req.user.id, ts]
-        )
-      : await pool.query(
-          `SELECT o."productId", s."productName", o.items, o.city, o.area, o.priority,
-                  TO_CHAR(NOW() AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY') AS "orderDate"
-           FROM "Orders" o LEFT JOIN "Stock" s ON s.id=o."productId"
-           WHERE o."retailerId"=$1 AND o.id >= $2 - 9 AND o.id <= $2
-           ORDER BY o.id ASC`,
-          [req.user.id, latestId]
-        );
-
     if (!r.rows.length) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
     const first = r.rows[0];
     res.json({
