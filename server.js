@@ -650,6 +650,85 @@ app.post('/api/orders/bulk', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
+// ANALYTICS — NESTLÉ SALES MANAGER
+// ══════════════════════════════════════════════
+app.get('/api/analytics/sales', auth, async (req, res) => {
+  if (!['order_team', 'admin'].includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const [kpi, byStatus, topCities, topRetailers, topProducts, monthly] = await Promise.all([
+      // KPI: totals for current calendar month
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE "createdAt" >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Colombo'))                                          AS "thisMonth",
+          COUNT(*) FILTER (WHERE status IN ('confirmed','consolidated','delivered'))                                                              AS "totalConfirmed",
+          COUNT(*) FILTER (WHERE status = 'delivered')                                                                                           AS "totalDelivered",
+          COUNT(*) FILTER (WHERE status = 'rejected')                                                                                            AS "totalRejected",
+          COUNT(*) FILTER (WHERE status IN ('confirmed','consolidated','delivered') AND "createdAt" >= NOW() - INTERVAL '30 days')               AS "last30Confirmed",
+          COUNT(*) FILTER (WHERE status = 'delivered' AND "createdAt" >= NOW() - INTERVAL '30 days')                                             AS "last30Delivered"
+        FROM "Orders"
+      `),
+      // Orders by status (all time)
+      pool.query(`
+        SELECT status, COUNT(*) AS count FROM "Orders" GROUP BY status ORDER BY count DESC
+      `),
+      // Top 5 cities by order count (last 30 days)
+      pool.query(`
+        SELECT city, COUNT(*) AS count
+        FROM "Orders"
+        WHERE city IS NOT NULL AND "createdAt" >= NOW() - INTERVAL '30 days'
+        GROUP BY city ORDER BY count DESC LIMIT 5
+      `),
+      // Top 5 retailers by order count (last 30 days)
+      pool.query(`
+        SELECT u.name AS retailer, COUNT(o.id) AS count
+        FROM "Orders" o JOIN "Users" u ON o."retailerId"=u.id
+        WHERE o."createdAt" >= NOW() - INTERVAL '30 days'
+        GROUP BY u.name ORDER BY count DESC LIMIT 5
+      `),
+      // Top 5 products by units ordered (last 30 days)
+      pool.query(`
+        SELECT s."productName", SUM(o.items) AS units
+        FROM "Orders" o JOIN "Stock" s ON o."productId"=s.id
+        WHERE o."createdAt" >= NOW() - INTERVAL '30 days'
+        GROUP BY s."productName" ORDER BY units DESC LIMIT 5
+      `),
+      // Monthly order count — last 6 months
+      pool.query(`
+        SELECT TO_CHAR(date_trunc('month', "createdAt" AT TIME ZONE 'Asia/Colombo'), 'Mon YYYY') AS month,
+               date_trunc('month', "createdAt" AT TIME ZONE 'Asia/Colombo') AS month_start,
+               COUNT(*) AS count
+        FROM "Orders"
+        WHERE "createdAt" >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Colombo') - INTERVAL '5 months'
+        GROUP BY month, month_start ORDER BY month_start ASC
+      `)
+    ]);
+
+    const k = kpi.rows[0];
+    const successRate = k.last30Confirmed > 0
+      ? Math.round((k.last30Delivered / k.last30Confirmed) * 100)
+      : null;
+
+    res.json({
+      kpi: {
+        thisMonth: parseInt(k.thisMonth),
+        totalConfirmed: parseInt(k.totalConfirmed),
+        totalDelivered: parseInt(k.totalDelivered),
+        totalRejected: parseInt(k.totalRejected),
+        deliverySuccessRate: successRate
+      },
+      byStatus: byStatus.rows.map(r => ({ status: r.status, count: parseInt(r.count) })),
+      topCities: topCities.rows.map(r => ({ city: r.city, count: parseInt(r.count) })),
+      topRetailers: topRetailers.rows.map(r => ({ retailer: r.retailer, count: parseInt(r.count) })),
+      topProducts: topProducts.rows.map(r => ({ productName: r.productName, units: parseInt(r.units) })),
+      monthly: monthly.rows.map(r => ({ month: r.month, count: parseInt(r.count) }))
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════
 // SALES REP
 // ══════════════════════════════════════════════
 app.get('/api/sales-rep/dashboard', auth, async (req, res) => {
