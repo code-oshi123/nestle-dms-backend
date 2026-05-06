@@ -364,15 +364,48 @@ app.get('/api/orders', auth, async (req, res) => {
       const srRow = await pool.query(`SELECT "assignedCity" FROM "Users" WHERE id=$1`, [req.user.id]);
       const srCity = srRow.rows[0]?.assignedCity;
       if (!srCity) return res.status(400).json({ error: 'No city assigned to your account. Contact admin.' });
+      // Group individual product rows into order batches.
+      // Rows share the same createdAt (PostgreSQL NOW() is constant within a transaction).
+      // NULL createdAt (old demo data) falls back to grouping by orderDate — acceptable limitation.
       r = await pool.query(
-        `SELECT id, "retailerName" AS retailer, city, area, items, kg,
-         priority AS prio, status, "confirmedBy", "rejectReason",
-         COALESCE("rejectCategory",'other') AS "rejectCategory",
-         TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
-         COALESCE("orderDate"::text,'') AS "orderDate"
-         FROM "Orders"
-         WHERE LOWER(city)=LOWER($1) AND status='pending'
-         ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "createdAt" ASC`,
+        `WITH batched AS (
+           SELECT
+             MIN(o.id)                                          AS "batchId",
+             ARRAY_AGG(o.id ORDER BY o.id)                     AS ids,
+             o."retailerId", o."retailerName",
+             o.city, o.area, o.priority,
+             SUM(o.items)                                       AS "totalItems",
+             SUM(o.kg)                                         AS "totalKg",
+             JSON_AGG(
+               JSON_BUILD_OBJECT(
+                 'productId',   o."productId",
+                 'productName', COALESCE(s."productName", 'Product ' || o."productId"::text),
+                 'items',       o.items
+               ) ORDER BY o.id
+             )                                                  AS products,
+             o."createdAt",
+             o."orderDate"
+           FROM "Orders" o
+           LEFT JOIN "Stock" s ON s.id = o."productId"
+           WHERE LOWER(o.city) = LOWER($1) AND o.status = 'pending'
+           GROUP BY o."retailerId", o."retailerName", o.city, o.area,
+                    o.priority, o."createdAt", o."orderDate"
+         )
+         SELECT
+           "batchId",
+           ids,
+           "retailerName"  AS retailer,
+           city, area,
+           priority        AS prio,
+           "totalItems"    AS items,
+           "totalKg"       AS kg,
+           products,
+           TO_CHAR("createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon HH24:MI') AS created,
+           COALESCE("orderDate"::text, '')  AS "orderDate"
+         FROM batched
+         ORDER BY
+           CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+           COALESCE("createdAt", "orderDate"::timestamptz) ASC`,
         [srCity]
       );
     } else {
