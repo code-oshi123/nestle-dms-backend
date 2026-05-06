@@ -3129,18 +3129,36 @@ app.put('/api/order-reminder/frequency', auth, async (req, res) => {
 // RETAILER LAST ORDER PRODUCTS
 // ══════════════════════════════════════════════
 
-// GET /api/orders/last-products — all products from the retailer's most recent order date
+// GET /api/orders/last-products — products from the retailer's single most recent order batch
 app.get('/api/orders/last-products', auth, async (req, res) => {
   if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
   try {
+    // Strategy: rows in the same bulk order share an identical createdAt (PostgreSQL NOW() is
+    // constant within a transaction). Use MAX(createdAt) on the latest orderDate to isolate
+    // the exact last batch. Fall back to DISTINCT ON productId for old rows with NULL createdAt.
     const r = await pool.query(
-      `SELECT o."productId", s."productName", o.items, o.city, o.area, o.priority,
+      `WITH last_date AS (
+         SELECT MAX("orderDate") AS d FROM "Orders" WHERE "retailerId" = $1
+       ),
+       last_ts AS (
+         SELECT MAX("createdAt") AS ts
+         FROM "Orders"
+         WHERE "retailerId" = $1
+           AND "orderDate" = (SELECT d FROM last_date)
+           AND "createdAt" IS NOT NULL
+       )
+       SELECT DISTINCT ON (o."productId")
+              o."productId", s."productName", o.items, o.city, o.area, o.priority,
               TO_CHAR(o."orderDate"::date, 'DD Mon YYYY') AS "orderDate"
        FROM "Orders" o
        LEFT JOIN "Stock" s ON s.id = o."productId"
        WHERE o."retailerId" = $1
-         AND o."orderDate" = (SELECT MAX("orderDate") FROM "Orders" WHERE "retailerId" = $1)
-       ORDER BY o.id ASC`,
+         AND o."orderDate" = (SELECT d FROM last_date)
+         AND (
+           (SELECT ts FROM last_ts) IS NULL
+           OR o."createdAt" = (SELECT ts FROM last_ts)
+         )
+       ORDER BY o."productId", o.id DESC`,
       [req.user.id]
     );
     if (!r.rows.length) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
