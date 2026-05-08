@@ -2768,6 +2768,7 @@ app.get('/api/stock', auth, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT s.id, s."productName", s."availableUnits", s."availableKg", s."weightPerUnit",
+              s.price,
               COALESCE(s."lowStockThreshold", 50) AS "lowStockThreshold",
               (SELECT COUNT(*) FROM "Orders" o WHERE o."productId"=s.id AND o.status='rejected'
                AND o."rejectCategory"='out_of_stock' AND o."stockWatchActive"=true) AS "watchCount",
@@ -2793,7 +2794,7 @@ app.get('/api/ai/retailer-context', auth, async (req, res) => {
   if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
   try {
     const r = await pool.query(
-      `SELECT o."productId", s."productName", o.items, o.status,
+      `SELECT o."productId", s."productName", s.price, o.items, o.status,
               TO_CHAR(COALESCE(o."createdAt" AT TIME ZONE 'Asia/Colombo',
                                o."orderDate"::timestamptz AT TIME ZONE 'Asia/Colombo'),
                       'YYYY-MM-DD') AS "date"
