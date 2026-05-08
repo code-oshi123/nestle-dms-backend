@@ -369,7 +369,7 @@ app.get('/api/orders', auth, async (req, res) => {
          d."driverName", d."vehicleId"
          FROM "Orders" o
          LEFT JOIN "Deliveries" d ON d."orderId" = o.id
-         WHERE o."retailerId"=$1 ORDER BY o."createdAt" DESC`,
+         WHERE o."retailerId"=$1 AND o.status != 'dismissed' ORDER BY o."createdAt" DESC`,
         [userId]
       );
     } else if (role === 'sales_rep') {
@@ -873,6 +873,22 @@ Please correct your order and resubmit, or contact our Order Team for assistance
   };
   return messages[category] || messages.other;
 }
+
+app.post('/api/orders/:id/dismiss', auth, async (req, res) => {
+  if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
+  try {
+    const check = await pool.query(
+      `SELECT id, "retailerId", status FROM "Orders" WHERE id=$1`,
+      [req.params.id]
+    );
+    if (!check.rows.length) return res.status(404).json({ error: 'Order not found' });
+    const o = check.rows[0];
+    if (o.retailerId !== req.user.id) return res.status(403).json({ error: 'Not your order' });
+    if (o.status !== 'rejected') return res.status(400).json({ error: 'Only rejected orders can be dismissed' });
+    await pool.query(`UPDATE "Orders" SET status='dismissed' WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.put('/api/orders/:id/confirm', auth, async (req, res) => {
   const { action, confirmedBy, rejectReason, rejectCategory } = req.body;
