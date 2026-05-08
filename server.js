@@ -3212,10 +3212,21 @@ app.put('/api/order-reminder/frequency', auth, async (req, res) => {
 // GET /api/orders/last-products — products from the retailer's single most recent order batch
 app.get('/api/orders/last-products', auth, async (req, res) => {
   if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
+
+  const sendResult = (rows) => {
+    if (!rows.length) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
+    const first = rows[0];
+    res.json({
+      orderDate: first.orderDate || null,
+      city:      first.city,
+      area:      first.area,
+      priority:  first.priority,
+      products:  rows.map(row => ({ productId: row.productId, productName: row.productName, items: row.items }))
+    });
+  };
+
+  // Try full query with orderDate column (requires migration)
   try {
-    // Strategy: rows in the same bulk order share an identical createdAt (PostgreSQL NOW() is
-    // constant within a transaction). Use MAX(createdAt) on the latest orderDate to isolate
-    // the exact last batch. Fall back to DISTINCT ON productId for old rows with NULL createdAt.
     const r = await pool.query(
       `WITH last_date AS (
          SELECT MAX("orderDate") AS d FROM "Orders" WHERE "retailerId" = $1
@@ -3241,15 +3252,32 @@ app.get('/api/orders/last-products', auth, async (req, res) => {
        ORDER BY o."productId", o.id DESC`,
       [req.user.id]
     );
-    if (!r.rows.length) return res.json({ products: [], orderDate: null, city: null, area: null, priority: null });
-    const first = r.rows[0];
-    res.json({
-      orderDate: first.orderDate,
-      city:      first.city,
-      area:      first.area,
-      priority:  first.priority,
-      products:  r.rows.map(row => ({ productId: row.productId, productName: row.productName, items: row.items }))
-    });
+    return sendResult(r.rows);
+  } catch(e) {
+    if (!e.message.includes('orderDate')) return res.status(500).json({ error: e.message });
+  }
+
+  // Fallback: orderDate column doesn't exist yet — use createdAt only
+  try {
+    const r = await pool.query(
+      `WITH last_ts AS (
+         SELECT MAX("createdAt") AS ts FROM "Orders"
+         WHERE "retailerId" = $1 AND "createdAt" IS NOT NULL
+       )
+       SELECT DISTINCT ON (o."productId")
+              o."productId", s."productName", o.items, o.city, o.area, o.priority,
+              NULL::text AS "orderDate"
+       FROM "Orders" o
+       LEFT JOIN "Stock" s ON s.id = o."productId"
+       WHERE o."retailerId" = $1
+         AND (
+           (SELECT ts FROM last_ts) IS NULL
+           OR o."createdAt" = (SELECT ts FROM last_ts)
+         )
+       ORDER BY o."productId", o.id DESC`,
+      [req.user.id]
+    );
+    return sendResult(r.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
