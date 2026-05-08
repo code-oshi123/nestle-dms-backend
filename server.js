@@ -2800,7 +2800,7 @@ app.get('/api/ai/retailer-context', auth, async (req, res) => {
        FROM "Orders" o
        LEFT JOIN "Stock" s ON s.id = o."productId"
        WHERE o."retailerId" = $1
-         AND COALESCE(o."createdAt", o."orderDate"::timestamptz) >= NOW() - INTERVAL '90 days'
+         AND COALESCE(o."createdAt", o."orderDate"::timestamptz) >= NOW() - INTERVAL '30 days'
        ORDER BY COALESCE(o."createdAt", o."orderDate"::timestamptz) DESC`,
       [req.user.id]
     );
