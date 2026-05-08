@@ -159,6 +159,19 @@ const token = jwt.sign(
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/me — returns fresh user profile (city, assignedCity) from DB
+app.get('/api/me', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, "Email" AS email, role, avatar, city, "assignedCity" FROM "Users" WHERE id=$1`,
+      [req.user.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    const u = r.rows[0];
+    res.json({ id: u.id, name: u.name, email: u.email, role: u.role, avatar: u.avatar, city: u.city || null, assignedCity: u.assignedCity || null });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══════════════════════════════════════════════
 // NOTIFICATIONS
 // ══════════════════════════════════════════════
