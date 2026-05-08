@@ -574,8 +574,9 @@ app.post('/api/orders/bulk', auth, async (req, res) => {
     await client.query('BEGIN');
 
     for (const order of orders) {
-      const { city, area, productId, productName, items, priority, notes, orderDate } = order;
+      const { city, area, productId, productName, items, kg, priority, notes, orderDate } = order;
       const itemsNum     = Number(items);
+      const kgNum        = parseFloat(kg) || 0;
       const productIdNum = productId ? Number(productId) : 0;
 
       if (!city || !area || !productIdNum || !Number.isInteger(itemsNum) || itemsNum <= 0) {
@@ -609,15 +610,15 @@ app.post('/api/orders/bulk', auth, async (req, res) => {
       try {
         const r = await client.query(
           `INSERT INTO "Orders"("retailerId","retailerName",city,area,items,kg,priority,notes,"productId",status,"orderDate","createdAt")
-           VALUES($1,$2,$3,$4,$5,0,$6,$7,$8,'pending',$9,NOW()) RETURNING id`,
-          [retailerId, retailerName, city, area.trim(), itemsNum, computedPriority, notes||'', productIdNum, orderDate||null]
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,NOW()) RETURNING id`,
+          [retailerId, retailerName, city, area.trim(), itemsNum, kgNum, computedPriority, notes||'', productIdNum, orderDate||null]
         );
         orderId = r.rows[0].id;
       } catch {
         const r = await client.query(
           `INSERT INTO "Orders"("retailerId","retailerName",city,area,items,kg,priority,notes,"productId",status,"createdAt")
-           VALUES($1,$2,$3,$4,$5,0,$6,$7,$8,'pending',NOW()) RETURNING id`,
-          [retailerId, retailerName, city, area.trim(), itemsNum, computedPriority, notes||'', productIdNum]
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',NOW()) RETURNING id`,
+          [retailerId, retailerName, city, area.trim(), itemsNum, kgNum, computedPriority, notes||'', productIdNum]
         );
         orderId = r.rows[0].id;
       }
@@ -3223,7 +3224,7 @@ app.get('/api/orders/last-products', auth, async (req, res) => {
          SELECT MAX("createdAt") AS ts
          FROM "Orders"
          WHERE "retailerId" = $1
-           AND "orderDate" = (SELECT d FROM last_date)
+           AND "orderDate" IS NOT DISTINCT FROM (SELECT d FROM last_date)
            AND "createdAt" IS NOT NULL
        )
        SELECT DISTINCT ON (o."productId")
@@ -3232,7 +3233,7 @@ app.get('/api/orders/last-products', auth, async (req, res) => {
        FROM "Orders" o
        LEFT JOIN "Stock" s ON s.id = o."productId"
        WHERE o."retailerId" = $1
-         AND o."orderDate" = (SELECT d FROM last_date)
+         AND o."orderDate" IS NOT DISTINCT FROM (SELECT d FROM last_date)
          AND (
            (SELECT ts FROM last_ts) IS NULL
            OR o."createdAt" = (SELECT ts FROM last_ts)
