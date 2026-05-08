@@ -2787,6 +2787,28 @@ app.get('/api/stock', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
+// AI ASSISTANT — retailer order history for spend tracking
+// ══════════════════════════════════════════════
+app.get('/api/ai/retailer-context', auth, async (req, res) => {
+  if (req.user?.role !== 'retailer') return res.status(403).json({ error: 'Retailers only' });
+  try {
+    const r = await pool.query(
+      `SELECT o."productId", s."productName", o.items, o.status,
+              TO_CHAR(COALESCE(o."createdAt" AT TIME ZONE 'Asia/Colombo',
+                               o."orderDate"::timestamptz AT TIME ZONE 'Asia/Colombo'),
+                      'YYYY-MM-DD') AS "date"
+       FROM "Orders" o
+       LEFT JOIN "Stock" s ON s.id = o."productId"
+       WHERE o."retailerId" = $1
+         AND COALESCE(o."createdAt", o."orderDate"::timestamptz) >= NOW() - INTERVAL '90 days'
+       ORDER BY COALESCE(o."createdAt", o."orderDate"::timestamptz) DESC`,
+      [req.user.id]
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════
 // AI ASSISTANT PROXY — keeps Anthropic API key safe on server
 // Set ANTHROPIC_API_KEY in Render environment variables
 // ══════════════════════════════════════════════
