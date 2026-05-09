@@ -924,7 +924,7 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
       if (!srCity || check.rows[0].city?.toLowerCase() !== srCity.toLowerCase()) {
         return res.status(403).json({ error: 'You can only manage orders from your assigned city' });
       }
-      if (action === 'confirm') {
+      if (action === 'confirm' && !req.body.force) {
         const pendingRow = await pool.query(
           `SELECT COUNT(*) FROM "Orders" WHERE LOWER(city)=LOWER($1) AND status='pending'`,
           [srCity]
