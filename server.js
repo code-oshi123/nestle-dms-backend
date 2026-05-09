@@ -1012,8 +1012,20 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
             }
           }
 
-          // 2. Generate 4-digit delivery PIN
-          const deliveryPin = String(Math.floor(1000 + Math.random() * 9000));
+          // 2. Reuse batch PIN if another product in the same order batch is already confirmed,
+          //    otherwise generate a new one — one PIN per batch, not per product
+          const batchPinRow = await pool.query(
+            `SELECT d."deliveryPin" FROM "Deliveries" d
+             JOIN "Orders" o2 ON o2.id = d."orderId"
+             WHERE o2."retailerId" = $1
+               AND o2."createdAt" = $2
+               AND d."deliveryPin" IS NOT NULL AND d."deliveryPin" != ''
+             LIMIT 1`,
+            [o.retailerId, o.createdAt]
+          );
+          const deliveryPin = batchPinRow.rows.length > 0
+            ? batchPinRow.rows[0].deliveryPin
+            : String(Math.floor(1000 + Math.random() * 9000));
 
           // 3. Create delivery record with PIN
           try {
