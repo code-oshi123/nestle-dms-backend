@@ -2950,8 +2950,8 @@ app.post('/api/deliveries/:id/verify-pin', auth, async (req, res) => {
     if (d.status === 'delivered') {
       return res.status(409).json({ error: 'This delivery is already marked as delivered.' });
     }
-    if (d.status !== 'in-transit') {
-      return res.status(400).json({ error: 'Delivery must be In Transit before PIN verification.' });
+    if (!['in-transit', 'loaded', 'assigned', 'warehouse_ready'].includes(d.status)) {
+      return res.status(400).json({ error: 'Delivery must be active before PIN verification.' });
     }
     if (!d.deliveryPin) {
       return res.status(400).json({ error: 'No PIN assigned to this delivery.' });
