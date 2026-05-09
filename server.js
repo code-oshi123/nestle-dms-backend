@@ -1338,8 +1338,12 @@ app.get('/api/deliveries', auth, async (req, res) => {
     } else {
       r = await pool.query(
         `SELECT d.*, o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio,
+         o."createdAt" AS "orderCreatedAt",
+         COALESCE(s."productName", 'Unknown Product') AS "productName",
          TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt"
-         FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
+         FROM "Deliveries" d
+         JOIN "Orders" o ON d."orderId"=o.id
+         LEFT JOIN "Stock" s ON s.id = o."productId"
          ORDER BY d."createdAt" DESC`
       );
     }
