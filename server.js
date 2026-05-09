@@ -1063,8 +1063,13 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
             );
           }
 
-          // 4. Count unassigned pending deliveries
-          const pendingRes = await pool.query(`SELECT COUNT(*) FROM "Deliveries" WHERE status='pending'`);
+          // 4. Count unassigned pending deliveries in this city only
+          const pendingRes = await pool.query(
+            `SELECT COUNT(*) FROM "Deliveries" d
+             JOIN "Orders" o2 ON o2.id = d."orderId"
+             WHERE d.status='pending' AND LOWER(o2.city)=LOWER($1)`,
+            [o.city]
+          );
           const pendingCount = parseInt(pendingRes.rows[0].count);
 
           // 5. Notify OPT of queue progress
@@ -1073,10 +1078,10 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
             const remaining = BATCH_SIZE - pendingCount;
             await notify(
               u.id,
-              `📦 Order Queued (${pendingCount}/${BATCH_SIZE})`,
+              `📦 Order Queued — ${o.city} (${pendingCount}/${BATCH_SIZE})`,
               pendingCount >= BATCH_SIZE
-                ? `${pendingCount} orders ready — auto-route is being created now!`
-                : `Order ${o.id} queued. ${remaining} more needed to trigger auto-route.`,
+                ? `${pendingCount} orders in ${o.city} ready — auto-route is being created now!`
+                : `Order ${o.id} (${o.city}) queued. ${remaining} more needed to trigger auto-route.`,
               pendingCount >= BATCH_SIZE ? 'success' : 'info', o.id
             );
           }
@@ -1084,15 +1089,16 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
           // 6. Trigger route creation when batch is full or "Confirm Anyway" forces it
           if (pendingCount >= BATCH_SIZE || req.body.triggerRoute) {
 
-            // Fetch all pending deliveries — include calculated kg
+            // Fetch all pending deliveries for this city only
             const batchRes = await pool.query(
               `SELECT d.id AS "deliveryId", o."retailerName", o.city, o.items,
                       COALESCE(o.kg, 0) AS kg, o.priority, o."retailerId", o.id AS "orderId",
                       o."productId"
                FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id
-               WHERE d.status='pending'
+               WHERE d.status='pending' AND LOWER(o.city)=LOWER($1)
                ORDER BY CASE o.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
-                        d."createdAt" ASC`
+                        d."createdAt" ASC`,
+              [o.city]
             );
             let batch = batchRes.rows;
 
