@@ -1047,19 +1047,21 @@ app.put('/api/orders/:id/confirm', auth, async (req, res) => {
           await pool.query(`UPDATE "Orders" SET status='consolidated' WHERE id=$1`, [o.id]);
           console.log(`[PIN] Generated ${deliveryPin} for order ${o.id} retailer ${o.retailerId}`);
 
-          // 4. Notify retailer with PIN prominently
-          await notify(
-            o.retailerId,
-            `✅ Order Confirmed — Your Delivery PIN: ${deliveryPin}`,
-            `Your order ${o.id} to ${o.city} (${orderKg.toFixed(1)}kg) is confirmed and queued.
+          // 4. Notify retailer with PIN only once per batch (when PIN is newly generated)
+          if (batchPinRow.rows.length === 0) {
+            await notify(
+              o.retailerId,
+              `✅ Order Confirmed — Your Delivery PIN: ${deliveryPin}`,
+              `Your order to ${o.city} (${orderKg.toFixed(1)}kg) is confirmed and queued.
 
 🔐 YOUR DELIVERY PIN: ${deliveryPin}
 
 When your driver arrives, they will ask for this 4-digit PIN to verify your identity before handing over the goods.
 
 ⚠️ Do NOT share this PIN with anyone other than your delivery driver.`,
-            'success', o.id
-          );
+              'success', o.id
+            );
+          }
 
           // 4. Count unassigned pending deliveries
           const pendingRes = await pool.query(`SELECT COUNT(*) FROM "Deliveries" WHERE status='pending'`);
@@ -1079,8 +1081,8 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
             );
           }
 
-          // 6. Trigger route creation when batch is full
-          if (pendingCount >= BATCH_SIZE) {
+          // 6. Trigger route creation when batch is full or "Confirm Anyway" forces it
+          if (pendingCount >= BATCH_SIZE || req.body.triggerRoute) {
 
             // Fetch all pending deliveries — include calculated kg
             const batchRes = await pool.query(
