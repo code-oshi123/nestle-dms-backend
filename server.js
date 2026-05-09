@@ -361,14 +361,17 @@ app.get('/api/orders', auth, async (req, res) => {
     let r;
     if (role === 'retailer') {
       r = await pool.query(
-        `SELECT o.id, o.city, o.area, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason", COALESCE(o."rejectCategory",'other') AS "rejectCategory",
+        `SELECT o.id, o."productId", COALESCE(s."productName",'Unknown Product') AS "productName",
+         o.city, o.area, o.items, o.kg, o.priority AS prio, o.status, o."rejectReason", COALESCE(o."rejectCategory",'other') AS "rejectCategory",
          COALESCE(d."deliveryPin",'') AS "deliveryPin", COALESCE(d."pinVerified",false) AS "pinVerified",
          TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo','DD Mon HH24:MI') AS created,
+         o."createdAt" AS "createdAtRaw",
          d.id AS "deliveryId", d.status AS "deliveryStatus",
          d."receiptConfirmed", TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
          d."driverName", d."vehicleId"
          FROM "Orders" o
          LEFT JOIN "Deliveries" d ON d."orderId" = o.id
+         LEFT JOIN "Stock" s ON s.id = o."productId"
          WHERE o."retailerId"=$1 AND o.status != 'dismissed' ORDER BY o."createdAt" DESC`,
         [userId]
       );
