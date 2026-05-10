@@ -370,7 +370,7 @@ app.get('/api/orders', auth, async (req, res) => {
          d."receiptConfirmed", TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
          d."driverName", d."vehicleId", d.eta,
          CASE WHEN d.status='in-transit' AND d."routeStopIndex" IS NOT NULL THEN
-           (SELECT COUNT(*)::int FROM "Deliveries" d2
+           (SELECT COUNT(DISTINCT d2."routeStopIndex")::int FROM "Deliveries" d2
             WHERE d2."driverId"=d."driverId"
               AND d2."routeStopIndex" IS NOT NULL
               AND d2."routeStopIndex" < d."routeStopIndex"
