@@ -368,7 +368,14 @@ app.get('/api/orders', auth, async (req, res) => {
          o."createdAt" AS "createdAtRaw",
          d.id AS "deliveryId", d.status AS "deliveryStatus",
          d."receiptConfirmed", TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt",
-         d."driverName", d."vehicleId"
+         d."driverName", d."vehicleId", d.eta,
+         CASE WHEN d.status='in-transit' AND d."routeStopIndex" IS NOT NULL THEN
+           (SELECT COUNT(*)::int FROM "Deliveries" d2
+            WHERE d2."driverId"=d."driverId"
+              AND d2."routeStopIndex" IS NOT NULL
+              AND d2."routeStopIndex" < d."routeStopIndex"
+              AND d2.status NOT IN ('delivered','failed'))
+         ELSE NULL END AS "stopsAhead"
          FROM "Orders" o
          LEFT JOIN "Deliveries" d ON d."orderId" = o.id
          LEFT JOIN "Stock" s ON s.id = o."productId"
@@ -1262,12 +1269,16 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
               const distKm=Math.round(totDist*1.3), durMins=Math.round(distKm*2.5);
               const cities=groupedStops.map(g=>g.city);
 
-              // Assign all deliveries — every delivery in the group gets the same stop's ETA
-              for(const stop of stopsData) {
+              // Ensure routeStopIndex column exists
+              await pool.query(`ALTER TABLE "Deliveries" ADD COLUMN IF NOT EXISTS "routeStopIndex" INTEGER`).catch(()=>{});
+
+              // Assign all deliveries — every delivery in the group gets the same stop's ETA and stop index
+              for(let si=0; si<stopsData.length; si++) {
+                const stop = stopsData[si];
                 for(const dId of stop.deliveryIds) {
                   await pool.query(
-                    `UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status='assigned',eta=$4 WHERE id=$5`,
-                    [drv.id,drv.name,veh.id,stop.eta,dId]
+                    `UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status='assigned',eta=$4,"routeStopIndex"=$5 WHERE id=$6`,
+                    [drv.id,drv.name,veh.id,stop.eta,si,dId]
                   );
                 }
               }
@@ -1927,31 +1938,88 @@ Please verify retailer address and reschedule.`,
     }
 
     // ══════════════════════════════════════════
-    // CASE 6: IN TRANSIT or OTHER FAILED
+    // CASE 6: IN TRANSIT
     // ══════════════════════════════════════════
-    const statusLabel = { 'in-transit':'In Transit 🚛', 'delivered':'Delivered ✅', 'failed':'Delivery Failed ❌' };
-    const msgType     = { 'in-transit':'info', 'delivered':'success', 'failed':'alert' };
+    if (newStatus === 'in-transit') {
+      // Find driver's current route
+      const routeRow = await pool.query(
+        `SELECT id, stops_data FROM "Routes"
+         WHERE ("driverId"=$1 OR "driverId"=(
+           SELECT dr.id FROM "Drivers" dr JOIN "Users" u ON lower(u.name)=lower(dr.name)
+           WHERE u.id=$1 AND u.role='distributor' LIMIT 1
+         )) ORDER BY "createdAt" DESC LIMIT 1`,
+        [driverId || req.user.id]
+      );
 
-    await notify(current.retailerId, `Delivery ${statusLabel[newStatus]}`,
-      newStatus === 'in-transit'
-        ? `Your delivery to ${current.city} is now on its way 🚛.${driverStr} Expected arrival: ${current.eta || 'soon'}.`
-        : `Your delivery to ${current.city} could not be completed.${noteStr} Our team will contact you to reschedule.`,
-      msgType[newStatus], req.params.id);
+      if (routeRow.rows.length && routeRow.rows[0].stops_data) {
+        const routeStops = JSON.parse(routeRow.rows[0].stops_data);
+
+        for (let si = 0; si < routeStops.length; si++) {
+          const stop = routeStops[si];
+          const ids = stop.deliveryIds || (stop.deliveryId ? [stop.deliveryId] : []);
+
+          // Mark all deliveries in this stop as in-transit (skip the one already updated above)
+          for (const did of ids) {
+            if (String(did) !== String(req.params.id)) {
+              await pool.query(
+                `UPDATE "Deliveries" SET status='in-transit', "updatedAt"=NOW()
+                 WHERE id=$1 AND status IN ('assigned','warehouse_ready','loaded')`,
+                [did]
+              );
+            }
+          }
+
+          // Notify each retailer with their queue position
+          if (ids.length) {
+            const retRow = await pool.query(
+              `SELECT o."retailerId" FROM "Deliveries" d JOIN "Orders" o ON d."orderId"=o.id WHERE d.id=$1 LIMIT 1`,
+              [ids[0]]
+            );
+            if (retRow.rows.length) {
+              const queueMsg = si === 0
+                ? `You're next! ${current.driverName || 'Your driver'} is heading your way. ETA: ${stop.eta || 'soon'}.`
+                : `${si} stop${si > 1 ? 's' : ''} before yours. ${current.driverName || 'Your driver'} is en route. ETA: ${stop.eta || 'soon'}.`;
+              await notify(retRow.rows[0].retailerId, '🚛 Your delivery is on the way!', queueMsg, 'info', String(ids[0]));
+            }
+          }
+        }
+      } else {
+        // No route record — notify just this retailer
+        await notify(current.retailerId, '🚛 Delivery In Transit',
+          `Your delivery to ${current.city} is now on its way.${driverStr} ETA: ${current.eta || 'soon'}.`,
+          'info', req.params.id);
+      }
+
+      for (const u of [...optUsers.rows, ...whUsers.rows]) {
+        await notify(u.id, 'Delivery In Transit 🚛',
+          `Delivery ${req.params.id} → ${current.city} (${current.retailer}).${driverStr} In transit.${noteStr}`,
+          'info', req.params.id);
+      }
+      if (driverId) {
+        await notify(driverId, 'Your Delivery: In Transit 🚛',
+          `Delivery ${req.params.id} to ${current.city} marked in-transit.${noteStr}`,
+          'info', req.params.id);
+      }
+      return res.json({ ok: true, newStatus, failureType: null, notified: true });
+    }
+
+    // ══════════════════════════════════════════
+    // CASE 7: OTHER FAILED (fallback)
+    // ══════════════════════════════════════════
+    await notify(current.retailerId, 'Delivery Failed ❌',
+      `Your delivery to ${current.city} could not be completed.${noteStr} Our team will contact you to reschedule.`,
+      'alert', req.params.id);
 
     for (const u of [...optUsers.rows, ...whUsers.rows]) {
-      await notify(u.id, `Delivery ${statusLabel[newStatus]}`,
-        `Delivery ${req.params.id} → ${current.city} (${current.retailer}).${driverStr} Status: ${newStatus}.${noteStr}`,
-        msgType[newStatus], req.params.id);
+      await notify(u.id, 'Delivery Failed ❌',
+        `Delivery ${req.params.id} → ${current.city} (${current.retailer}).${driverStr} Status: failed.${noteStr}`,
+        'alert', req.params.id);
     }
-
     if (driverId) {
-      await notify(driverId, `Your Delivery: ${statusLabel[newStatus]}`,
-        newStatus === 'in-transit'
-          ? `Delivery ${req.params.id} to ${current.city} marked in-transit.${noteStr}`
-          : `Delivery ${req.params.id} to ${current.city} recorded as failed.${noteStr}`,
-        msgType[newStatus], req.params.id);
+      await notify(driverId, 'Delivery: Failed ❌',
+        `Delivery ${req.params.id} to ${current.city} recorded as failed.${noteStr}`,
+        'alert', req.params.id);
     }
-
     res.json({ ok: true, newStatus, failureType, notified: 4 });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
