@@ -1086,8 +1086,8 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
             );
           }
 
-          // 6. Trigger route creation when batch is full or "Confirm Anyway" forces it
-          if (pendingCount >= BATCH_SIZE || req.body.triggerRoute) {
+          // 6. Trigger route only on the last confirmed order so all deliveries exist before assigning
+          if (req.body.triggerRoute) {
 
             // Fetch all pending deliveries for this city only
             const batchRes = await pool.query(
