@@ -1229,26 +1229,47 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
               const drv=drvRes.rows[0], veh=vehRes.rows[0];
               console.log('[route] Assigning to driver:', drv.name, '| vehicle:', veh.id, '| cap:', veh.capNum||veh.cap, 'kg');
 
+              // Group by retailer → one stop per retailer (preserves priority-optimised order)
+              const retailerGroups = new Map();
+              for (const d of optimised) {
+                if (!retailerGroups.has(d.retailerId)) {
+                  retailerGroups.set(d.retailerId, {
+                    deliveryIds: [d.deliveryId], retailerName: d.retailerName, city: d.city,
+                    totalItems: parseInt(d.items)||0, totalKg: parseFloat(d.kg)||0, priority: d.priority
+                  });
+                } else {
+                  const g = retailerGroups.get(d.retailerId);
+                  g.deliveryIds.push(d.deliveryId);
+                  g.totalItems += parseInt(d.items)||0;
+                  g.totalKg += parseFloat(d.kg)||0;
+                  const ps = ['urgent','high','normal'];
+                  if (ps.indexOf(d.priority) < ps.indexOf(g.priority)) g.priority = d.priority;
+                }
+              }
+              const groupedStops = [...retailerGroups.values()];
+
               // Build ETAs — 45 min per stop from now+1hr
               let dH=new Date().getHours()+1, dM=0;
-              const stopsData = optimised.map((d,i) => {
+              const stopsData = groupedStops.map((g) => {
                 dH+=Math.floor((dM+45)/60); dM=(dM+45)%60;
                 const eta=`${String(dH%24).padStart(2,'0')}:${String(dM).padStart(2,'0')}`;
-                return { deliveryId:d.deliveryId, retailer:d.retailerName, city:d.city, items:d.items, priority:d.priority, eta, stopNote:'' };
+                return { deliveryId:g.deliveryIds[0], deliveryIds:g.deliveryIds, retailer:g.retailerName, city:g.city, items:g.totalItems, kg:g.totalKg, priority:g.priority, eta, stopNote:'' };
               });
 
               // Total distance
               let totDist=0; let prev=WH[bestWH];
               optimised.forEach(d=>{ const c=CC[d.city]||CC['Colombo']; totDist+=hv(prev,c); prev=c; });
               const distKm=Math.round(totDist*1.3), durMins=Math.round(distKm*2.5);
-              const cities=optimised.map(d=>d.city);
+              const cities=groupedStops.map(g=>g.city);
 
-              // Assign all deliveries
+              // Assign all deliveries — every delivery in the group gets the same stop's ETA
               for(const stop of stopsData) {
-                await pool.query(
-                  `UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status='assigned',eta=$4 WHERE id=$5`,
-                  [drv.id,drv.name,veh.id,stop.eta,stop.deliveryId]
-                );
+                for(const dId of stop.deliveryIds) {
+                  await pool.query(
+                    `UPDATE "Deliveries" SET "driverId"=$1,"driverName"=$2,"vehicleId"=$3,status='assigned',eta=$4 WHERE id=$5`,
+                    [drv.id,drv.name,veh.id,stop.eta,dId]
+                  );
+                }
               }
 
               // Create single route record
@@ -1256,13 +1277,13 @@ When your driver arrives, they will ask for this 4-digit PIN to verify your iden
                 await pool.query(
                   `INSERT INTO "Routes"("driverId","driverName","vehicleId",stops,"distKm","durMins",cities,"stops_data","warehouse","createdAt")
                    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
-                  [drv.id,drv.name,veh.id,optimised.length,distKm,durMins,
+                  [drv.id,drv.name,veh.id,groupedStops.length,distKm,durMins,
                    JSON.stringify(cities),JSON.stringify(stopsData),bestWH]
                 );
               } catch(re){ console.error('[auto-route]',re.message); }
 
               // Notify driver — full briefing
-              const stopLines=stopsData.map((s,i)=>`  Stop ${i+1}: ${s.city} — ${s.retailer} (${s.items} items, ${parseFloat(optimised[i]?.kg||0).toFixed(1)}kg) [${s.priority||'normal'}] ETA ${s.eta}`).join('\n');
+              const stopLines=stopsData.map((s,i)=>`  Stop ${i+1}: ${s.city} — ${s.retailer} (${s.items} items, ${parseFloat(s.kg||0).toFixed(1)}kg) [${s.priority||'normal'}] ETA ${s.eta}`).join('\n');
               await notify(
                 drv.userId||drv.id,
                 `🗺️ Auto-Route — ${optimised.length} Stops · ${totalKg.toFixed(1)}kg`,
