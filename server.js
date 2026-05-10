@@ -1358,7 +1358,8 @@ app.get('/api/deliveries', auth, async (req, res) => {
     } else {
       r = await pool.query(
         `SELECT d.*, o."retailerName" AS retailer, o.city, o.items, o.kg, o.priority AS prio,
-         TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon HH24:MI') AS "orderCreatedAt",
+         o."createdAt" AS "orderCreatedAt",
+         TO_CHAR(o."createdAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon HH24:MI') AS "orderPlacedAt",
          COALESCE(s."productName", 'Unknown Product') AS "productName",
          TO_CHAR(d."receiptAt" AT TIME ZONE 'Asia/Colombo', 'DD Mon YYYY HH24:MI') AS "receiptAt"
          FROM "Deliveries" d
