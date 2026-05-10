@@ -3436,7 +3436,7 @@ app.get('/api/suggest', auth, async (req, res) => {
       suggestions = r.rows.map(r => ({ ...r, basis: `popular in ${city}` }));
     }
 
-    // Fallback: global top 5 if city had no data or no city given
+    // Fallback 1: global top 5 by order history
     if (!suggestions || !suggestions.length) {
       const r = await pool.query(
         `SELECT o."productId", s."productName",
@@ -3449,6 +3449,19 @@ app.get('/api/suggest', auth, async (req, res) => {
          LIMIT 5`
       );
       suggestions = r.rows.map(r => ({ ...r, basis: 'popular overall' }));
+    }
+
+    // Fallback 2: if zero order data at all, show top stocked products
+    if (!suggestions || !suggestions.length) {
+      const r = await pool.query(
+        `SELECT id AS "productId", "productName",
+                0 AS "totalOrdered", 0 AS "orderCount"
+         FROM "Stock"
+         WHERE "availableUnits" > 0
+         ORDER BY "availableUnits" DESC
+         LIMIT 5`
+      );
+      suggestions = r.rows.map(r => ({ ...r, basis: 'available now' }));
     }
 
     res.json({ hasPastOrders, suggestions });
