@@ -712,12 +712,8 @@ app.post('/api/orders/bulk', auth, async (req, res) => {
 app.get('/api/analytics/sales', auth, async (req, res) => {
   if (!['order_team', 'admin'].includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
   try {
-    const [
-      kpi, byStatus, topCities, topRetailers, topProducts, monthly,
-      deliveryKpi, orderFunnel, daily, retailerSeg, salesReps,
-      lowStock, productMovement, warehouseUtil, activeDrivers
-    ] = await Promise.all([
-      // 0 — KPI: order totals
+    const [kpi, byStatus, topCities, topRetailers, topProducts, monthly] = await Promise.all([
+      // KPI: totals for current calendar month
       pool.query(`
         SELECT
           COUNT(*) FILTER (WHERE "createdAt" >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Colombo'))                                          AS "thisMonth",
@@ -725,296 +721,49 @@ app.get('/api/analytics/sales', auth, async (req, res) => {
           COUNT(*) FILTER (WHERE status = 'delivered')                                                                                           AS "totalDelivered",
           COUNT(*) FILTER (WHERE status = 'rejected')                                                                                            AS "totalRejected",
           COUNT(*) FILTER (WHERE status IN ('confirmed','consolidated','delivered') AND "createdAt" >= NOW() - INTERVAL '30 days')               AS "last30Confirmed",
-          COUNT(*) FILTER (WHERE status = 'delivered' AND "createdAt" >= NOW() - INTERVAL '30 days')                                             AS "last30Delivered",
-          COUNT(*) FILTER (WHERE "createdAt"::date = (NOW() AT TIME ZONE 'Asia/Colombo')::date)                                                  AS "ordersToday",
-          COUNT(*) FILTER (WHERE status='pending')                                                                                               AS "ordersPending",
-          COUNT(*) FILTER (WHERE status IN ('confirmed','consolidated'))                                                                         AS "ordersInPipeline",
-          COALESCE(SUM(items) FILTER (WHERE "createdAt"::date = (NOW() AT TIME ZONE 'Asia/Colombo')::date AND status IN ('confirmed','consolidated','delivered')),0) AS "unitsToday",
-          COALESCE(SUM(items) FILTER (WHERE "createdAt" >= NOW() - INTERVAL '7 days'  AND status IN ('confirmed','consolidated','delivered')),0)  AS "units7d",
-          COALESCE(SUM(items) FILTER (WHERE "createdAt" >= NOW() - INTERVAL '14 days' AND "createdAt" < NOW() - INTERVAL '7 days' AND status IN ('confirmed','consolidated','delivered')),0) AS "unitsPrev7d"
+          COUNT(*) FILTER (WHERE status = 'delivered' AND "createdAt" >= NOW() - INTERVAL '30 days')                                             AS "last30Delivered"
         FROM "Orders"
       `),
-      // 1 — Orders by status
-      pool.query(`SELECT status, COUNT(*) AS count FROM "Orders" GROUP BY status ORDER BY count DESC`),
-      // 2 — Top cities (last 30d)
+      // Orders by status (all time)
       pool.query(`
-        SELECT city, COUNT(*) AS count,
-               COALESCE(SUM(items),0) AS units
+        SELECT status, COUNT(*) AS count FROM "Orders" GROUP BY status ORDER BY count DESC
+      `),
+      // Top 5 cities by order count (last 30 days)
+      pool.query(`
+        SELECT city, COUNT(*) AS count
         FROM "Orders"
         WHERE city IS NOT NULL AND "createdAt" >= NOW() - INTERVAL '30 days'
-        GROUP BY city ORDER BY count DESC LIMIT 8
+        GROUP BY city ORDER BY count DESC LIMIT 5
       `),
-      // 3 — Top retailers (last 30d)
+      // Top 5 retailers by order count (last 30 days)
       pool.query(`
-        SELECT u.name AS retailer, u.city, COUNT(o.id) AS count,
-               COALESCE(SUM(o.items),0) AS units,
-               TO_CHAR(MAX(o."createdAt") AT TIME ZONE 'Asia/Colombo','DD Mon') AS "lastOrder"
+        SELECT u.name AS retailer, COUNT(o.id) AS count
         FROM "Orders" o JOIN "Users" u ON o."retailerId"=u.id
         WHERE o."createdAt" >= NOW() - INTERVAL '30 days'
-        GROUP BY u.name, u.city ORDER BY count DESC LIMIT 6
+        GROUP BY u.name ORDER BY count DESC LIMIT 5
       `),
-      // 4 — Top products (last 30d)
+      // Top 5 products by units ordered (last 30 days)
       pool.query(`
         SELECT s."productName", SUM(o.items) AS units
         FROM "Orders" o JOIN "Stock" s ON o."productId"=s.id
         WHERE o."createdAt" >= NOW() - INTERVAL '30 days'
-        GROUP BY s."productName" ORDER BY units DESC LIMIT 6
+        GROUP BY s."productName" ORDER BY units DESC LIMIT 5
       `),
-      // 5 — Monthly trend (6 months)
+      // Monthly order count — last 6 months
       pool.query(`
-        SELECT TO_CHAR(date_trunc('month', "createdAt" AT TIME ZONE 'Asia/Colombo'), 'Mon') AS month,
+        SELECT TO_CHAR(date_trunc('month', "createdAt" AT TIME ZONE 'Asia/Colombo'), 'Mon YYYY') AS month,
                date_trunc('month', "createdAt" AT TIME ZONE 'Asia/Colombo') AS month_start,
-               COUNT(*) AS count,
-               COALESCE(SUM(items),0) AS units
+               COUNT(*) AS count
         FROM "Orders"
         WHERE "createdAt" >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Colombo') - INTERVAL '5 months'
         GROUP BY month, month_start ORDER BY month_start ASC
-      `),
-      // 6 — Delivery KPI (today + last 30d)
-      pool.query(`
-        SELECT
-          COUNT(*)                                                              AS "total",
-          COUNT(*) FILTER (WHERE status='delivered')                            AS "delivered",
-          COUNT(*) FILTER (WHERE status='in-transit')                           AS "inTransit",
-          COUNT(*) FILTER (WHERE status IN ('assigned','warehouse_ready','loaded')) AS "preparing",
-          COUNT(*) FILTER (WHERE status='pending')                              AS "pending",
-          COUNT(*) FILTER (WHERE status='failed')                               AS "failed",
-          COUNT(*) FILTER (WHERE status IN ('assigned','warehouse_ready','loaded','in-transit') AND "createdAt" < NOW() - INTERVAL '2 days') AS "atRisk",
-          COUNT(*) FILTER (WHERE status='warehouse_ready')                      AS "cargoReady"
-        FROM "Deliveries"
-      `),
-      // 7 — Order processing funnel (last 30d totals across stages)
-      pool.query(`
-        SELECT
-          (SELECT COUNT(*) FROM "Orders" WHERE "createdAt" >= NOW() - INTERVAL '30 days')                                  AS "placed",
-          (SELECT COUNT(*) FROM "Orders" WHERE status IN ('confirmed','consolidated','delivered') AND "createdAt" >= NOW() - INTERVAL '30 days') AS "approved",
-          (SELECT COUNT(*) FROM "Deliveries" WHERE status IN ('warehouse_ready','loaded','in-transit','delivered'))        AS "packed",
-          (SELECT COUNT(*) FROM "Deliveries" WHERE status IN ('in-transit','delivered'))                                   AS "dispatched",
-          (SELECT COUNT(*) FROM "Deliveries" WHERE status='delivered')                                                      AS "delivered"
-      `),
-      // 8 — Daily volume (last 14 days)
-      pool.query(`
-        WITH d AS (
-          SELECT generate_series((NOW() AT TIME ZONE 'Asia/Colombo')::date - INTERVAL '13 days',
-                                 (NOW() AT TIME ZONE 'Asia/Colombo')::date, '1 day')::date AS day
-        )
-        SELECT TO_CHAR(d.day,'DD Mon') AS label, d.day,
-               COALESCE(COUNT(o.id),0) AS count,
-               COALESCE(SUM(o.items),0) AS units
-        FROM d
-        LEFT JOIN "Orders" o ON (o."createdAt" AT TIME ZONE 'Asia/Colombo')::date = d.day
-        GROUP BY d.day ORDER BY d.day ASC
-      `),
-      // 9 — Retailer segmentation (active / medium / risk / inactive)
-      pool.query(`
-        WITH r AS (
-          SELECT u.id, u.name, u.city,
-                 MAX(o."createdAt") AS "lastOrder",
-                 COUNT(o.id) FILTER (WHERE o."createdAt" >= NOW() - INTERVAL '30 days') AS recent
-          FROM "Users" u
-          LEFT JOIN "Orders" o ON o."retailerId"=u.id
-          WHERE u.role='retailer'
-          GROUP BY u.id, u.name, u.city
-        )
-        SELECT
-          COUNT(*) FILTER (WHERE recent >= 4)                                                          AS "active",
-          COUNT(*) FILTER (WHERE recent BETWEEN 1 AND 3)                                               AS "medium",
-          COUNT(*) FILTER (WHERE recent = 0 AND "lastOrder" >= NOW() - INTERVAL '60 days')             AS "atRisk",
-          COUNT(*) FILTER (WHERE "lastOrder" IS NULL OR "lastOrder" < NOW() - INTERVAL '60 days')      AS "inactive",
-          COUNT(*)                                                                                     AS "total"
-        FROM r
-      `),
-      // 10 — Sales reps performance (last 30d)
-      pool.query(`
-        SELECT u.name, u."assignedCity" AS city,
-               COUNT(o.id) FILTER (WHERE o."createdAt" >= NOW() - INTERVAL '30 days') AS orders,
-               COUNT(o.id) FILTER (WHERE o.status IN ('confirmed','consolidated','delivered') AND o."createdAt" >= NOW() - INTERVAL '30 days') AS confirmed,
-               COALESCE(SUM(o.items) FILTER (WHERE o."createdAt" >= NOW() - INTERVAL '30 days'),0) AS units
-        FROM "Users" u
-        LEFT JOIN "Orders" o ON o.city = u."assignedCity"
-        WHERE u.role='sales_rep'
-        GROUP BY u.name, u."assignedCity"
-        ORDER BY orders DESC LIMIT 8
-      `),
-      // 11 — Low stock alerts
-      pool.query(`
-        SELECT id, "productName", "availableUnits",
-               COALESCE("lowStockThreshold",50) AS threshold
-        FROM "Stock"
-        WHERE "availableUnits" <= COALESCE("lowStockThreshold",50)
-        ORDER BY "availableUnits" ASC LIMIT 5
-      `),
-      // 12 — Product movement (fast vs slow movers, 30d)
-      pool.query(`
-        SELECT s.id, s."productName", s."availableUnits",
-               COALESCE(SUM(o.items) FILTER (WHERE o."createdAt" >= NOW() - INTERVAL '30 days' AND o.status IN ('confirmed','consolidated','delivered')),0) AS sold30
-        FROM "Stock" s
-        LEFT JOIN "Orders" o ON o."productId"=s.id
-        GROUP BY s.id, s."productName", s."availableUnits"
-        ORDER BY sold30 DESC
-      `),
-      // 13 — Warehouse utilisation snapshot
-      pool.query(`
-        SELECT
-          COALESCE(SUM("availableUnits"),0) AS "totalUnits",
-          COUNT(*) AS "skuCount",
-          COUNT(*) FILTER (WHERE "availableUnits" <= COALESCE("lowStockThreshold",50)) AS "lowSkus",
-          COUNT(*) FILTER (WHERE "availableUnits" = 0) AS "outOfStock"
-        FROM "Stock"
-      `),
-      // 14 — Active drivers
-      pool.query(`SELECT COUNT(*) AS cnt FROM "Drivers"`)
+      `)
     ]);
 
     const k = kpi.rows[0];
-    const dk = deliveryKpi.rows[0];
-    const f = orderFunnel.rows[0];
-    const seg = retailerSeg.rows[0];
-    const wh = warehouseUtil.rows[0];
-
     const successRate = k.last30Confirmed > 0
       ? Math.round((k.last30Delivered / k.last30Confirmed) * 100)
       : null;
-    const sla = parseInt(dk.total) > 0
-      ? Math.round(((parseInt(dk.total) - parseInt(dk.atRisk) - parseInt(dk.failed)) / parseInt(dk.total)) * 100)
-      : 100;
-    const fillRate = parseInt(dk.total) > 0
-      ? Math.round((parseInt(dk.delivered) / parseInt(dk.total)) * 100)
-      : 0;
-    const cargoReadyPct = parseInt(dk.total) > 0
-      ? Math.round((parseInt(dk.cargoReady) / Math.max(parseInt(dk.preparing) + parseInt(dk.cargoReady), 1)) * 100)
-      : 0;
-
-    // Revenue estimate (LKR 250 per unit average — UI labels this as estimated)
-    const revenueToday = parseInt(k.unitsToday) * 250;
-    const units7d  = parseFloat(k.units7d);
-    const unitsPrev = parseFloat(k.unitsPrev7d);
-    const wow = unitsPrev > 0 ? Math.round(((units7d - unitsPrev) / unitsPrev) * 100) : null;
-
-    // Fast vs slow movers
-    const products = productMovement.rows;
-    const fastMovers = products.filter(p => parseInt(p.sold30) > 0).slice(0, 5);
-    const slowMovers = products.filter(p => parseInt(p.sold30) === 0 && parseInt(p.availableUnits) > 0).slice(0, 5);
-
-    // Distributors (synthesized from cities, since the brief lists them but DB has Drivers/cities)
-    const cityRows = topCities.rows.map(r => ({ city: r.city, count: parseInt(r.count), units: parseInt(r.units) }));
-    const totalCityOrders = cityRows.reduce((a,b) => a + b.count, 0) || 1;
-    const DISTRIBUTOR_MAP = {
-      'Colombo': 'WestLine Distributors',
-      'Gampaha': 'CityLink Distribution',
-      'Kandy':   'FastMove Logistics',
-      'Galle':   'Lanka Distribution',
-      'Negombo': 'CityLink Distribution',
-      'Kurunegala': 'Lanka Distribution',
-      'Matara':  'Lanka Distribution',
-      'Jaffna':  'Lanka Distribution'
-    };
-    const distAgg = {};
-    cityRows.forEach(c => {
-      const dist = DISTRIBUTOR_MAP[c.city] || 'Lanka Distribution';
-      if (!distAgg[dist]) distAgg[dist] = { name: dist, orders: 0, cities: [] };
-      distAgg[dist].orders += c.count;
-      distAgg[dist].cities.push(c.city);
-    });
-    const distributors = Object.values(distAgg).map(d => {
-      // Simulate fill-rate & SLA from delivery KPI signal
-      const rand = (d.name.length * 7) % 9;
-      const fr = Math.max(72, Math.min(98, fillRate + rand - 4));
-      const slaPct = Math.max(70, Math.min(99, sla + ((d.name.length * 3) % 7) - 3));
-      return { ...d, fillRate: fr, sla: slaPct, share: Math.round((d.orders / totalCityOrders) * 100) };
-    }).sort((a,b) => b.orders - a.orders);
-
-    // AI recommendations — derived from real signals
-    const aiInsights = [];
-    if (fastMovers[0]) {
-      const fm = fastMovers[0];
-      const lowSig = parseInt(fm.availableUnits) < parseInt(fm.sold30);
-      aiInsights.push({
-        type: 'opportunity', confidence: 92,
-        title: `Increase ${fm.productName} stock in top territories`,
-        body: `${fm.productName} sold ${fm.sold30} units in 30d. ${lowSig ? 'Stock running low — recommend +15% replenishment.' : 'Trend is strong — keep buffer healthy.'}`
-      });
-    }
-    if (parseInt(dk.atRisk) > 0) {
-      aiInsights.push({
-        type: 'risk', confidence: 88,
-        title: `${dk.atRisk} deliveries likely to miss SLA today`,
-        body: `Deliveries open for 48h+. Suggest dispatching priority routes first and notifying drivers.`
-      });
-    }
-    if (parseInt(seg.atRisk) > 0) {
-      aiInsights.push({
-        type: 'action', confidence: 81,
-        title: `Re-engage ${seg.atRisk} inactive retailers`,
-        body: `Retailers with no order in 30d but active in last 60d. Recommend rep visit + targeted promo.`
-      });
-    }
-    if (topCities.rows[0]) {
-      const tc = topCities.rows[0];
-      aiInsights.push({
-        type: 'forecast', confidence: 76,
-        title: `Demand expected to rise in ${tc.city} next week`,
-        body: `${tc.city} leads volume with ${tc.count} orders (30d). Pre-position inventory and add a rep visit slot.`
-      });
-    }
-    if (distributors[0] && parseInt(dk.failed) > 0) {
-      aiInsights.push({
-        type: 'risk', confidence: 70,
-        title: `${distributors[0].name} causing ${Math.round((parseInt(dk.failed)/Math.max(parseInt(dk.total),1))*100)}% of recent delivery delays`,
-        body: `Review routing rules and driver allocation. Consider redistribution to backup partner.`
-      });
-    }
-    if (slowMovers[0]) {
-      aiInsights.push({
-        type: 'action', confidence: 68,
-        title: `${slowMovers.length} SKUs are not moving — clear or promote`,
-        body: `Slow movers: ${slowMovers.slice(0,3).map(p=>p.productName).join(', ')}. Recommend bundle promos.`
-      });
-    }
-
-    // Critical alerts — derived from low stock / SLA / inactive
-    const alerts = [];
-    lowStock.rows.forEach(p => {
-      alerts.push({
-        level: parseInt(p.availableUnits) === 0 ? 'critical' : 'warning',
-        ico: '📦',
-        title: `Low stock: ${p.productName}`,
-        body: `${p.availableUnits} units remaining (threshold ${p.threshold}).`,
-        time: 'now'
-      });
-    });
-    if (parseInt(dk.atRisk) > 0) {
-      alerts.push({
-        level: 'critical', ico: '🚨',
-        title: `SLA risk on ${dk.atRisk} deliveries`,
-        body: 'Open over 48h — dispatch escalation recommended.',
-        time: 'live'
-      });
-    }
-    if (parseInt(dk.failed) > 0) {
-      alerts.push({
-        level: 'critical', ico: '❌',
-        title: `${dk.failed} delivery failure${parseInt(dk.failed)===1?'':'s'} recorded`,
-        body: 'Driver feedback / customer follow-up required.',
-        time: '24h'
-      });
-    }
-    if (parseInt(seg.atRisk) > 0) {
-      alerts.push({
-        level: 'warning', ico: '🏪',
-        title: `${seg.atRisk} retailers turning inactive`,
-        body: 'No orders in 30 days — assign rep follow-up.',
-        time: 'today'
-      });
-    }
-    if (fastMovers[0]) {
-      alerts.push({
-        level: 'opportunity', ico: '📈',
-        title: `Demand spike: ${fastMovers[0].productName}`,
-        body: `${fastMovers[0].sold30} units in last 30 days — top mover.`,
-        time: 'trend'
-      });
-    }
 
     res.json({
       kpi: {
@@ -1022,68 +771,13 @@ app.get('/api/analytics/sales', auth, async (req, res) => {
         totalConfirmed: parseInt(k.totalConfirmed),
         totalDelivered: parseInt(k.totalDelivered),
         totalRejected: parseInt(k.totalRejected),
-        deliverySuccessRate: successRate,
-        ordersToday: parseInt(k.ordersToday),
-        ordersPending: parseInt(k.ordersPending),
-        ordersInPipeline: parseInt(k.ordersInPipeline),
-        unitsToday: parseInt(k.unitsToday),
-        revenueToday,
-        wow,
-        sla,
-        fillRate,
-        cargoReadyPct,
-        delivered: parseInt(dk.delivered),
-        inTransit: parseInt(dk.inTransit),
-        preparing: parseInt(dk.preparing),
-        atRisk: parseInt(dk.atRisk),
-        failed: parseInt(dk.failed),
-        activeRetailers: parseInt(seg.active) + parseInt(seg.medium),
-        totalRetailers: parseInt(seg.total),
-        activeDrivers: parseInt(activeDrivers.rows[0].cnt)
+        deliverySuccessRate: successRate
       },
       byStatus: byStatus.rows.map(r => ({ status: r.status, count: parseInt(r.count) })),
-      topCities: cityRows,
-      topRetailers: topRetailers.rows.map(r => ({
-        retailer: r.retailer, city: r.city,
-        count: parseInt(r.count), units: parseInt(r.units), lastOrder: r.lastOrder
-      })),
+      topCities: topCities.rows.map(r => ({ city: r.city, count: parseInt(r.count) })),
+      topRetailers: topRetailers.rows.map(r => ({ retailer: r.retailer, count: parseInt(r.count) })),
       topProducts: topProducts.rows.map(r => ({ productName: r.productName, units: parseInt(r.units) })),
-      monthly: monthly.rows.map(r => ({ month: r.month, count: parseInt(r.count), units: parseInt(r.units) })),
-      daily: daily.rows.map(r => ({ label: r.label, count: parseInt(r.count), units: parseInt(r.units) })),
-      funnel: {
-        placed: parseInt(f.placed),
-        approved: parseInt(f.approved),
-        packed: parseInt(f.packed),
-        dispatched: parseInt(f.dispatched),
-        delivered: parseInt(f.delivered)
-      },
-      retailerSegments: {
-        active: parseInt(seg.active),
-        medium: parseInt(seg.medium),
-        atRisk: parseInt(seg.atRisk),
-        inactive: parseInt(seg.inactive),
-        total: parseInt(seg.total)
-      },
-      salesReps: salesReps.rows.map(r => ({
-        name: r.name, city: r.city || '—',
-        orders: parseInt(r.orders), confirmed: parseInt(r.confirmed), units: parseInt(r.units)
-      })),
-      lowStock: lowStock.rows.map(r => ({
-        id: r.id, productName: r.productName,
-        availableUnits: parseInt(r.availableUnits), threshold: parseInt(r.threshold)
-      })),
-      fastMovers: fastMovers.map(r => ({ productName: r.productName, sold30: parseInt(r.sold30), stock: parseInt(r.availableUnits) })),
-      slowMovers: slowMovers.map(r => ({ productName: r.productName, sold30: parseInt(r.sold30), stock: parseInt(r.availableUnits) })),
-      warehouses: [
-        { name: 'Colombo',  utilization: Math.min(95, Math.round((parseInt(wh.totalUnits) % 7000) / 70 + 60)), skus: parseInt(wh.skuCount), lowSkus: parseInt(wh.lowSkus) },
-        { name: 'Kelaniya', utilization: Math.min(95, Math.round((parseInt(wh.totalUnits) % 5500) / 65 + 55)), skus: Math.round(parseInt(wh.skuCount)*0.7), lowSkus: Math.round(parseInt(wh.lowSkus)*0.6) },
-        { name: 'Gampaha',  utilization: Math.min(95, Math.round((parseInt(wh.totalUnits) % 4800) / 60 + 50)), skus: Math.round(parseInt(wh.skuCount)*0.6), lowSkus: Math.round(parseInt(wh.lowSkus)*0.4) },
-        { name: 'Kandy',    utilization: Math.min(95, Math.round((parseInt(wh.totalUnits) % 4200) / 55 + 45)), skus: Math.round(parseInt(wh.skuCount)*0.5), lowSkus: Math.round(parseInt(wh.lowSkus)*0.3) }
-      ],
-      distributors,
-      aiInsights,
-      alerts,
-      generatedAt: new Date().toISOString()
+      monthly: monthly.rows.map(r => ({ month: r.month, count: parseInt(r.count) }))
     });
   } catch (e) {
     console.error(e);
